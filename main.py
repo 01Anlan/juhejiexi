@@ -39,7 +39,7 @@ DEFAULT_DOUYIN_PROFILE_TIMEOUT = 60
 DEFAULT_AUTO_UPDATE_INTERVAL = 30
 
 
-@register("astrbot_plugin_juhejiexi", "Anlan", "聚合解析与抖音主页解析插件", "v5.2.3")
+@register("astrbot_plugin_juhejiexi", "Anlan", "聚合解析与抖音主页解析插件", "v1.0.0")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
