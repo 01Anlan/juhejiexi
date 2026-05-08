@@ -432,7 +432,14 @@ class MediaParserPlugin(Star):
         if video_url:
             playable_url = self._resolve_direct_media_url(video_url)
             yield event.plain_result(message)
-            yield event.chain_result([Video.fromURL(playable_url)])
+            try:
+                await event.send(MessageChain([Video.fromURL(playable_url)]))
+            except Exception as exc:
+                logger.warning("视频直发失败，降级为链接返回: %s", exc)
+                yield event.plain_result(
+                    "⚠️ 视频直发失败，已降级为直链返回\n"
+                    f"🎬 视频直链：{playable_url}"
+                )
             return
 
         if image_urls:
