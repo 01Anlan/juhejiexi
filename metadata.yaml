@@ -1,4 +1,4 @@
-name: astrbot_plugin_media_parser # 插件唯一识别名
+name: astrbot_plugin_juhejiexi # 插件唯一识别名
 display_name: 聚合解析助手 # 插件展示名称
 desc: 聚合解析与抖音主页解析插件 # 插件简短描述
 help: /jx，/dyhome，/dytrack，/dytarget，/dyplay，/dyupdate，/dyupdateone，/dycollection，/dycollection_query # 插件帮助信息

@@ -1,4 +1,4 @@
-# astrbot_plugin_media_parser
+# astrbot_plugin_juhejiexi
 
 AstrBot 聚合解析插件。
 
@@ -7,6 +7,7 @@ AstrBot 聚合解析插件。
 - 聚合解析
 - 抖音主页解析
 - 抖音收藏解析（推荐独立部署）
+- OneBot 协议下普通消息自动识别分享链接并聚合解析
 
 核心实现位于 [`main.py`](README.md)，插件元数据位于 [`metadata.yaml`](metadata.yaml)。
 
@@ -14,7 +15,7 @@ AstrBot 聚合解析插件。
 
 | 指令 | 说明 | 状态 |
 | --- | --- | --- |
-| `/jx 分享链接` | 聚合解析，返回视频或图片资源链接 | 可用 |
+| `/jx 分享链接` | 手动触发聚合解析，返回视频或图片资源链接 | 可用 |
 | `/dyhome 抖音主页分享文本或链接` | 解析抖音主页并生成本地 TXT 文件 | 可用 |
 | `/dytrack 抖音主页分享文本或链接` | 将旧主页链接补录进更新记录 | 可用 |
 | `/dytarget` | 绑定自动更新完成后的主动推送目标会话 | 可用 |
@@ -36,6 +37,17 @@ AstrBot 聚合解析插件。
   - 仅返回视频和图片链接
   - 尽量过滤无关字段
   - 图集内容支持发送群/私聊合并转发消息
+
+### OneBot 自动聚合解析
+
+- 触发方式：OneBot 协议下，普通消息中包含分享链接时自动触发
+- 处理函数：[`MediaParserPlugin.auto_aggregate_parse_for_onebot()`](main.py:44)
+- 规则：
+  - 仅在 OneBot 场景下生效
+  - 无需输入 [`/jx`](README.md:17)
+  - 普通消息里只要识别到链接，就会自动按聚合解析逻辑回复
+  - 以 `/` 开头的命令消息不会触发自动解析，避免和其他指令冲突
+  - [`/dyhome`](README.md:18)、[`/dyupdate`](README.md:22)、[`/dyupdateone`](README.md:23)、[`/dytarget`](README.md:20)、[`/dytrack`](README.md:19)、[`/dymenu`](README.md:21)、[`/dyplay`](README.md:21)、[`/dycollection`](README.md:24)、[`/dycollection_query`](README.md:25) 等文本指令也不会被当作自动解析消息处理
 
 ### 抖音主页解析
 
@@ -113,6 +125,16 @@ AstrBot 聚合解析插件。
   - 若配置了 [`collection_email`](_conf_schema.json)，提交任务时会附带 `email` 参数作为异步完成通知邮箱
   - 解析完成后返回 TXT 下载链接
   - 如需更稳定长期使用，推荐独立部署
+
+#### Cookie 获取说明
+
+- 建议使用浏览器无痕模式登录抖音账号后获取，这样拿到的 Cookie 通常更完整、更稳定。
+- 按 `F12` 打开开发者工具，进入“网络 / Network”。
+- 刷新页面后找到以 `feed` 开头的请求。
+- 打开该请求并复制其中完整的 `Cookie` 请求头内容。
+- 重点确认 Cookie 中包含 `odin_tt` 字段。
+
+![抖音 Cookie 获取说明](https://blog.zhcnli.com/wp-content/uploads/2026/04/20260410201734697-dycookie.jpg)
 
 ## 配置说明
 
@@ -206,11 +228,9 @@ API Key 获取地址：
 如果这个项目对你有帮助，欢迎赞助支持。
 
 > [!NOTE]
-> 赞助二维码图片后续补充，当前先保留占位链接。
+> 欢迎赞助支持项目持续维护与更新。
 
 ![赞助二维码](https://blog.zhcnli.com/wp-content/uploads/2026/04/20260419122856231-sponsor-placeholder.jpg)
-
-- 赞助图片链接：<https://blog.zhcnli.com/wp-content/uploads/2026/04/20260419122856231-sponsor-placeholder.jpg>
 
 ## 相关链接
 

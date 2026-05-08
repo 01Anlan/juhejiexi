@@ -39,7 +39,7 @@ DEFAULT_DOUYIN_PROFILE_TIMEOUT = 60
 DEFAULT_AUTO_UPDATE_INTERVAL = 30
 
 
-@register("astrbot_plugin_media_parser", "Anlan", "聚合解析与抖音主页解析插件", "v5.2.3")
+@register("astrbot_plugin_juhejiexi", "Anlan", "聚合解析与抖音主页解析插件", "v5.2.3")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -60,49 +60,20 @@ class MediaParserPlugin(Star):
         if not self.auto_update_task or self.auto_update_task.done():
             self.auto_update_task = asyncio.create_task(self._auto_update_loop())
 
+    @filter.event_message_type("all")
+    async def auto_aggregate_parse_for_onebot(self, event: AstrMessageEvent):
+        """OneBot 场景下自动识别普通消息中的链接并执行聚合解析。"""
+        if not self._should_auto_parse_onebot_message(event):
+            return
+
+        async for result in self._handle_aggregate_parse(event, require_command=False):
+            yield result
+
     @filter.command("jx")
     async def aggregate_parse(self, event: AstrMessageEvent):
         """聚合解析：输入分享链接，优先直接发送视频；图集/多图使用合并转发节点发送。"""
-        target_url = self._extract_url(event.message_str)
-        if not target_url:
-            yield event.plain_result("用法：/jx 分享链接")
-            return
-
-        aggregate_api_key = self.config.get("aggregate_api_key", "")
-        if not aggregate_api_key:
-            yield event.plain_result("未配置聚合解析 API 密钥")
-            return
-
-        try:
-            api_url = AGGREGATE_API.format(apikey=quote(aggregate_api_key, safe="")) + quote(target_url, safe="")
-            payload = self._request_json(api_url)
-        except Exception as exc:
-            logger.exception("聚合解析失败: %s", exc)
-            yield event.plain_result(f"聚合解析失败：{exc}")
-            return
-
-        data = payload.get("data") or {}
-        message = self._format_aggregate_result(payload)
-        video_url = self._pick_video_url(data) if isinstance(data, dict) else None
-        image_urls = self._pick_image_urls(data) if isinstance(data, dict) else []
-
-        if video_url:
-            playable_url = self._resolve_direct_media_url(video_url)
-            yield event.plain_result(message)
-            yield event.chain_result([Video.fromURL(playable_url)])
-            return
-
-        if image_urls:
-            yield event.plain_result(self._format_aggregate_summary(payload, include_image_links=False))
-            if self._supports_forward_node(event):
-                node = self._build_aggregate_image_forward_node(data if isinstance(data, dict) else {}, image_urls)
-                yield event.chain_result([node])
-            else:
-                for image_url in image_urls:
-                    yield event.chain_result([Image.fromURL(image_url)])
-            return
-
-        yield event.plain_result(message)
+        async for result in self._handle_aggregate_parse(event, require_command=True):
+            yield result
 
     @filter.command("dyhome")
     async def douyin_profile_parse(self, event: AstrMessageEvent):
@@ -393,6 +364,72 @@ class MediaParserPlugin(Star):
             keyword in unified_msg_origin
             for keyword in ["onebot", "v11", "friendmessage", "groupmessage"]
         )
+
+    def _is_onebot_event(self, event: AstrMessageEvent) -> bool:
+        unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").lower()
+        return any(keyword in unified_msg_origin for keyword in ["onebot", "v11"])
+
+    def _should_auto_parse_onebot_message(self, event: AstrMessageEvent) -> bool:
+        if not self._is_onebot_event(event):
+            return False
+
+        text = str(getattr(event, "message_str", "") or "").strip()
+        if not text:
+            return False
+
+        lowered_text = text.lower()
+        if lowered_text.startswith("/"):
+            return False
+
+        if lowered_text.startswith(("jx ", "dyhome", "dyupdate", "dyupdateone", "dytarget", "dytrack", "dymenu", "dyplay", "dycollection", "dycollection_query")):
+            return False
+
+        return self._extract_url(text) is not None
+
+    async def _handle_aggregate_parse(self, event: AstrMessageEvent, require_command: bool):
+        target_url = self._extract_url(event.message_str)
+        if not target_url:
+            if require_command:
+                yield event.plain_result("用法：/jx 分享链接")
+            return
+
+        aggregate_api_key = self.config.get("aggregate_api_key", "")
+        if not aggregate_api_key:
+            if require_command:
+                yield event.plain_result("未配置聚合解析 API 密钥")
+            return
+
+        try:
+            api_url = AGGREGATE_API.format(apikey=quote(aggregate_api_key, safe="")) + quote(target_url, safe="")
+            payload = self._request_json(api_url)
+        except Exception as exc:
+            logger.exception("聚合解析失败: %s", exc)
+            if require_command:
+                yield event.plain_result(f"聚合解析失败：{exc}")
+            return
+
+        data = payload.get("data") or {}
+        message = self._format_aggregate_result(payload)
+        video_url = self._pick_video_url(data) if isinstance(data, dict) else None
+        image_urls = self._pick_image_urls(data) if isinstance(data, dict) else []
+
+        if video_url:
+            playable_url = self._resolve_direct_media_url(video_url)
+            yield event.plain_result(message)
+            yield event.chain_result([Video.fromURL(playable_url)])
+            return
+
+        if image_urls:
+            yield event.plain_result(self._format_aggregate_summary(payload, include_image_links=False))
+            if self._supports_forward_node(event):
+                node = self._build_aggregate_image_forward_node(data if isinstance(data, dict) else {}, image_urls)
+                yield event.chain_result([node])
+            else:
+                for image_url in image_urls:
+                    yield event.chain_result([Image.fromURL(image_url)])
+            return
+
+        yield event.plain_result(message)
 
     def _is_auto_update_enabled(self) -> bool:
         return bool(self.config.get("douyin_profile_auto_update_enabled", False))
