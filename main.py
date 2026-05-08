@@ -60,7 +60,6 @@ class MediaParserPlugin(Star):
         if not self.auto_update_task or self.auto_update_task.done():
             self.auto_update_task = asyncio.create_task(self._auto_update_loop())
 
-    @filter.event_message_type("all")
     async def auto_aggregate_parse_for_onebot(self, event: AstrMessageEvent):
         """OneBot 场景下自动识别普通消息中的链接并执行聚合解析。"""
         if not self._should_auto_parse_onebot_message(event):
