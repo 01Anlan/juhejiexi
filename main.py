@@ -369,7 +369,7 @@ class MediaParserPlugin(Star):
         unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").lower()
         return any(
             keyword in unified_msg_origin
-            for keyword in ["onebot", "v11", "friendmessage", "groupmessage"]
+            for keyword in ["onebot", "v11", "aiocqhttp", "friendmessage", "groupmessage"]
         )
 
     def _is_onebot_event(self, event: AstrMessageEvent) -> bool:
@@ -1239,6 +1239,10 @@ class MediaParserPlugin(Star):
         return "未知"
 
     def _pick_video_url(self, data: Dict[str, Any]) -> Optional[str]:
+        resource_type = str(data.get("type") or "").strip().lower()
+        if resource_type in {"image", "images", "photo", "album", "gallery", "img"}:
+            return None
+
         candidates = [
             data.get("url"),
             data.get("video"),
@@ -1254,9 +1258,26 @@ class MediaParserPlugin(Star):
                     candidates.append(item.get("url"))
 
         for item in candidates:
-            if isinstance(item, str) and item.startswith(("http://", "https://")):
+            if self._is_probable_video_url(item):
                 return item
         return None
+
+    def _is_probable_video_url(self, value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+
+        url = value.strip()
+        if not url.startswith(("http://", "https://")):
+            return False
+
+        lowered_url = url.lower()
+        if lowered_url.endswith((".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg")):
+            return False
+
+        if any(keyword in lowered_url for keyword in ["/ies-music/", "music", "audio", "song"]):
+            return False
+
+        return True
 
     def _pick_image_urls(self, data: Dict[str, Any]) -> List[str]:
         candidates: List[str] = []
