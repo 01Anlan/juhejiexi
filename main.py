@@ -39,7 +39,7 @@ DEFAULT_DOUYIN_PROFILE_TIMEOUT = 60
 DEFAULT_AUTO_UPDATE_INTERVAL = 30
 
 
-@register("astrbot_plugin_juhejiexi", "Anlan", "聚合解析与抖音主页解析插件", "v1.0.0")
+@register("astrbot_plugin_juhejiexi", "Anlan", "聚合解析与抖音主页解析插件", "v1.0.1")
 class MediaParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -60,6 +60,7 @@ class MediaParserPlugin(Star):
         if not self.auto_update_task or self.auto_update_task.done():
             self.auto_update_task = asyncio.create_task(self._auto_update_loop())
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def auto_aggregate_parse_for_onebot(self, event: AstrMessageEvent):
         """OneBot 场景下自动识别普通消息中的链接并执行聚合解析。"""
         if not self._should_auto_parse_onebot_message(event):
