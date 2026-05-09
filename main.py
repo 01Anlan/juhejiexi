@@ -29,6 +29,25 @@ DOUYIN_COLLECTION_API = (
     "?apikey={apikey}"
 )
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+AUTO_PARSE_HOST_KEYWORDS = (
+    "douyin.com",
+    "iesdouyin.com",
+    "douyinstatic.com",
+    "jimeng.jianying.com",
+    "capcut.cn",
+    "kuaishou.com",
+    "chenzhongtech.com",
+    "xiaohongshu.com",
+    "xhslink.com",
+    "xhscdn.com",
+    "doubao.com",
+    "pipix.com",
+    "pipixia.com",
+    "ppxvod.com",
+    "izuiyou.com",
+    "bilibili.com",
+    "b23.tv",
+)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 PROFILE_RECORD_FILE = os.path.join(BASE_DIR, "douyin_profile_records.json")
@@ -400,7 +419,18 @@ class MediaParserPlugin(Star):
         if lowered_text.startswith(("jx ", "dyhome", "dyupdate", "dyupdateone", "dytarget", "dytrack", "dymenu", "dyplay", "dycollection", "dycollection_query")):
             return False
 
-        return self._extract_url(text) is not None
+        target_url = self._extract_url(text)
+        if not target_url:
+            return False
+
+        return self._is_supported_auto_parse_url(target_url)
+
+    def _is_supported_auto_parse_url(self, url: str) -> bool:
+        if not isinstance(url, str) or not url:
+            return False
+
+        lowered_url = url.lower()
+        return any(keyword in lowered_url for keyword in AUTO_PARSE_HOST_KEYWORDS)
 
     async def _handle_aggregate_parse(self, event: AstrMessageEvent, require_command: bool):
         target_url = self._extract_url(event.message_str)
