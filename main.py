@@ -35,6 +35,10 @@ AUTO_PARSE_HOST_KEYWORDS = (
     "douyinstatic.com",
     "jimeng.jianying.com",
     "capcut.cn",
+    "qianwen.com",
+    "activity.qianwen.com",
+    "quark.cn",
+    "quark-aistudio-cdn.quark.cn",
     "kuaishou.com",
     "chenzhongtech.com",
     "xiaohongshu.com",
@@ -1254,6 +1258,8 @@ class MediaParserPlugin(Star):
 
     def _detect_platform(self, data: Dict[str, Any]) -> str:
         url_text = " ".join(self._collect_candidate_urls(data)).lower()
+        if "qianwen" in url_text or "quark-aistudio" in url_text:
+            return "通义千问"
         if "douyin" in url_text or "aweme" in url_text:
             return "抖音"
         if "kuaishou" in url_text or "yximgs" in url_text or "djvod" in url_text:
@@ -1273,24 +1279,59 @@ class MediaParserPlugin(Star):
         if resource_type in {"image", "images", "photo", "album", "gallery", "img"}:
             return None
 
-        candidates = [
-            data.get("url"),
-            data.get("video"),
-            data.get("video_url"),
-            data.get("play"),
-            data.get("play_url"),
-        ]
+        raw_payload = data.get("raw") if isinstance(data.get("raw"), dict) else {}
+        raw_media = raw_payload.get("media") if isinstance(raw_payload.get("media"), list) else []
+
+        for item in raw_media:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or item.get("type") or "").strip().lower()
+            candidate_url = item.get("url")
+            if kind == "video" and self._is_probable_video_url(candidate_url):
+                return candidate_url
 
         videos = data.get("videos")
         if isinstance(videos, list):
-            for item in videos:
-                if isinstance(item, dict) and item.get("url"):
-                    candidates.append(item.get("url"))
+            sorted_videos = sorted(
+                [item for item in videos if isinstance(item, dict)],
+                key=lambda item: (
+                    self._safe_int(item.get("height")),
+                    self._safe_int(item.get("width")),
+                    self._safe_int(item.get("duration")),
+                ),
+                reverse=True,
+            )
+            for item in sorted_videos:
+                candidate_url = item.get("url")
+                item_type = str(item.get("type") or "video").strip().lower()
+                if item_type == "video" and self._is_probable_video_url(candidate_url):
+                    return candidate_url
 
+        urls = data.get("urls")
+        if isinstance(urls, list):
+            for item in urls:
+                if self._is_probable_video_url(item):
+                    return item
+
+        candidates = [
+            data.get("play"),
+            data.get("play_url"),
+            data.get("download_url"),
+            data.get("source_url"),
+            data.get("video"),
+            data.get("video_url"),
+            data.get("url"),
+        ]
         for item in candidates:
             if self._is_probable_video_url(item):
                 return item
         return None
+
+    def _safe_int(self, value: Any) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
 
     def _is_probable_video_url(self, value: Any) -> bool:
         if not isinstance(value, str):
