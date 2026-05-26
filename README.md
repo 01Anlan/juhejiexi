@@ -1,6 +1,6 @@
 # astrbot_plugin_juhejiexi
 
-AstrBot 聚合解析插件。
+AstrBot 聚合解析插件，支持抖音(实况)，快手，小红书(实况)，哔站，人民日报，豆包，即梦，通义千问解析。
 
 ## 功能概览
 
