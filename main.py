@@ -4,6 +4,7 @@ import random
 import re
 import time
 import asyncio
+from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, unquote
@@ -326,6 +327,11 @@ class MediaParserPlugin(Star):
 
         yield event.plain_result(self._format_account_cookie_query_result(payload, job_id))
 
+    @filter.command("dyhelp")
+    async def douyin_help(self, event: AstrMessageEvent):
+        """显示抖音相关指令帮助与统计。"""
+        yield event.plain_result(self._format_dyhelp())
+
     def _request_json(self, url: str, timeout: Optional[int] = None) -> Dict[str, Any]:
         request = Request(
             url,
@@ -420,7 +426,7 @@ class MediaParserPlugin(Star):
         if lowered_text.startswith("/"):
             return False
 
-        if lowered_text.startswith(("jx ", "dyhome", "dyupdate", "dyupdateone", "dytarget", "dytrack", "dymenu", "dyplay", "dycollection", "dycollection_query")):
+        if lowered_text.startswith(("jx ", "dyhome", "dyupdate", "dyupdateone", "dytarget", "dytrack", "dymenu", "dyplay", "dycollection", "dycollection_query", "dyhelp")):
             return False
 
         target_url = self._extract_url(text)
@@ -621,6 +627,41 @@ class MediaParserPlugin(Star):
         for char in ["*", "_", "`", "[", "]", "(", ")", "~", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"]:
             sanitized = sanitized.replace(char, f"\\{char}")
         return sanitized
+
+    def _get_douyin_command_definitions(self) -> "OrderedDict[str, str]":
+        return OrderedDict([
+            ("/dyhome", "解析抖音主页并生成本地 TXT 文件"),
+            ("/dytrack", "补录旧主页分享文本或链接到更新记录"),
+            ("/dyupdate", "顺序更新全部已记录的抖音主页"),
+            ("/dyupdateone", "按作者名或文件名更新单个主页记录"),
+            ("/dytarget", "绑定自动更新结果的主动推送会话"),
+            ("/dymenu", "查看已保存的主页 TXT 播放菜单"),
+            ("/dyplay", "按文件名播放 TXT 中的视频链接"),
+            ("/dycollection", "提交点赞或收藏内容解析任务"),
+            ("/dycollection_query", "查询点赞或收藏解析任务状态"),
+            ("/dyhelp", "查看抖音指令帮助与统计"),
+        ])
+
+    def _format_dyhelp(self) -> str:
+        command_definitions = self._get_douyin_command_definitions()
+        command_count = len(command_definitions)
+        tracked_profile_count = len(self.profile_records)
+        saved_txt_count = len(self._list_download_txt_files())
+        auto_update_enabled = "开启" if self._is_auto_update_enabled() else "关闭"
+        auto_update_time = self._get_auto_update_time() or "未设置"
+
+        lines: List[str] = [
+            "┏━📘 抖音指令统计 ━┓",
+            f"┃ 指令总数：{command_count}",
+            f"┃ 主页记录：{tracked_profile_count}",
+            f"┃ TXT 文件：{saved_txt_count}",
+            f"┃ 自动更新：{auto_update_enabled} / {auto_update_time}",
+            "┣━ 指令列表",
+        ]
+        for command_name, description in command_definitions.items():
+            lines.append(f"┃ {command_name} - {description}")
+        lines.append("┗━━━━━━━━━━━━━━┛")
+        return "\n".join(lines)
 
     def _load_auto_update_target(self) -> Dict[str, str]:
         if not os.path.exists(AUTO_UPDATE_TARGET_FILE):
