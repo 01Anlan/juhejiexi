@@ -447,27 +447,6 @@ class MediaParserPlugin(Star):
         configured_name = str(self.config.get("forward_node_name", "") or "").strip()
         return configured_name or fallback_name or "聚合解析助手"
 
-    def _get_aggregate_image_send_mode(self) -> str:
-        mode = str(self.config.get("aggregate_image_send_mode", "separate") or "separate").strip().lower()
-        if mode in {"forward", "node", "merged", "forward_node"}:
-            return "forward"
-        return "separate"
-
-    def _build_aggregate_image_forward_node(self, data: Dict[str, Any], image_urls: List[str]) -> Node:
-        fallback_name = str(data.get("author") or data.get("title") or "聚合解析助手").strip() or "聚合解析助手"
-        node_name = self._get_forward_node_name(fallback_name)
-        node_uin = self._get_forward_node_uin()
-        content = [Plain(f"图集共 {len(image_urls)} 张")]
-        content.extend(Image.fromURL(image_url) for image_url in image_urls)
-        return Node(uin=node_uin, name=node_name, content=content)
-
-    def _supports_forward_node(self, event: AstrMessageEvent) -> bool:
-        unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").lower()
-        return any(
-            keyword in unified_msg_origin
-            for keyword in ["onebot", "v11", "aiocqhttp", "friendmessage", "groupmessage"]
-        )
-
     def _is_admin_user(self, event: AstrMessageEvent) -> bool:
         raw_whitelist = self.config.get("admin_user_ids", [])
         if not raw_whitelist:
@@ -562,11 +541,6 @@ class MediaParserPlugin(Star):
 
         if image_urls:
             yield event.plain_result(self._format_aggregate_summary(payload, include_image_links=False))
-            if self._get_aggregate_image_send_mode() == "forward" and self._supports_forward_node(event):
-                node = self._build_aggregate_image_forward_node(data if isinstance(data, dict) else {}, image_urls)
-                yield event.chain_result([node])
-                return
-
             for image_url in image_urls:
                 yield event.image_result(image_url)
             return
