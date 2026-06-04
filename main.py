@@ -447,6 +447,12 @@ class MediaParserPlugin(Star):
         configured_name = str(self.config.get("forward_node_name", "") or "").strip()
         return configured_name or fallback_name or "聚合解析助手"
 
+    def _get_aggregate_image_send_mode(self) -> str:
+        mode = str(self.config.get("aggregate_image_send_mode", "separate") or "separate").strip().lower()
+        if mode in {"forward", "node", "merged", "forward_node"}:
+            return "forward"
+        return "separate"
+
     def _build_aggregate_image_forward_node(self, data: Dict[str, Any], image_urls: List[str]) -> Node:
         fallback_name = str(data.get("author") or data.get("title") or "聚合解析助手").strip() or "聚合解析助手"
         node_name = self._get_forward_node_name(fallback_name)
@@ -551,29 +557,18 @@ class MediaParserPlugin(Star):
         if video_url:
             playable_url = self._resolve_direct_media_url(video_url)
             yield event.plain_result(message)
-            try:
-                await event.send(MessageChain([Video.fromURL(playable_url)]))
-            except Exception as exc:
-                logger.warning("视频直发失败，降级为链接返回: %s", exc)
-                yield event.plain_result(
-                    "⚠️ 视频直发失败，已降级为直链返回\n"
-                    f"🎬 视频直链：{playable_url}"
-                )
+            yield event.chain_result([Video.fromURL(playable_url)])
             return
 
         if image_urls:
             yield event.plain_result(self._format_aggregate_summary(payload, include_image_links=False))
-            if self._supports_forward_node(event):
+            if self._get_aggregate_image_send_mode() == "forward" and self._supports_forward_node(event):
                 node = self._build_aggregate_image_forward_node(data if isinstance(data, dict) else {}, image_urls)
-                try:
-                    await event.send(MessageChain([node]))
-                    return
-                except Exception as exc:
-                    logger.warning("图集合并转发发送失败，降级为逐张图片发送: %s", exc)
-                    yield event.plain_result("⚠️ 图集合并转发失败，已降级为逐张图片发送")
+                yield event.chain_result([node])
+                return
 
             for image_url in image_urls:
-                yield event.chain_result([Image.fromURL(image_url)])
+                yield event.image_result(image_url)
             return
 
         yield event.plain_result(message)
