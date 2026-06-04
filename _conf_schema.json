@@ -1,4 +1,10 @@
 {
+    "admin_user_ids": {
+        "description": "管理员用户白名单",
+        "type": "list",
+        "hint": "填写允许使用 /dyupdate 和 /dytarget 等管理类指令的用户 ID（如 QQ 号）。留空则不限制，任何人均可使用。每行填一个 ID。",
+        "default": []
+    },
     "aggregate_api_key": {
         "description": "聚合解析 API 密钥",
         "type": "string",
@@ -6,16 +12,26 @@
         "default": "",
         "obvious_hint": true
     },
+    "aggregate_image_send_mode": {
+        "description": "聚合解析图集发送模式",
+        "type": "string",
+        "hint": "控制 /jx 解析到图集/多图时的发送方式。separate=逐张图片发送（默认，兼容 NapCat），forward=尝试合并转发，失败后自动降级逐张发送。",
+        "default": "separate",
+        "options": [
+            "separate",
+            "forward"
+        ]
+    },
     "forward_node_uin": {
         "description": "合并转发显示 QQ 号",
         "type": "int",
-        "hint": "OneBot v11 合并转发节点显示使用的 QQ 号。用于 /jx 图集/多图转发显示。",
+        "hint": "OneBot v11 合并转发节点显示使用的 QQ 号。仅当 aggregate_image_send_mode=forward 时用于 /jx 图集/多图转发显示。",
         "default": 0
     },
     "forward_node_name": {
         "description": "合并转发显示名称",
         "type": "string",
-        "hint": "OneBot v11 合并转发节点显示使用的名称。留空时优先使用作者名。",
+        "hint": "OneBot v11 合并转发节点显示使用的名称。仅当 aggregate_image_send_mode=forward 时生效，留空时优先使用作者名。",
         "default": ""
     },
     "douyin_profile_api_key": {
@@ -56,7 +72,13 @@
     "douyin_profile_auto_update_interval": {
         "description": "抖音主页自动更新请求间隔（秒）",
         "type": "int",
-        "hint": "控制定时自动更新时每个主页请求之间的等待秒数，避免短时间请求过多导致后端封控。默认 30 秒，可设为 0 表示不额外等待。",
+        "hint": "控制定时自动更新时每个主页请求之间的等待秒数。实际等待时间会在 [interval, interval×2] 范围内随机抖动，模拟人工行为，降低 Cookie 被封控风险。默认 30 秒（实际抖动范围 30~60 秒），可设为 0 表示不额外等待。",
+        "default": 30
+    },
+    "douyin_profile_pre_check_minutes": {
+        "description": "自动更新提前预检时间（分钟）",
+        "type": "int",
+        "hint": "在正式自动更新时间前 N 分钟，后台自动轻量扫描全部主页，记录有新作品的条目，正式更新时只处理这批。设为 0 表示不提前预检，直接在更新时逐条判断。例如自动更新时间 03:30、此项设为 30，则 03:00 触发预检扫描。",
         "default": 30
     },
     "douyin_profile_auto_update_push_hint": {
