@@ -61,6 +61,8 @@ AUTO_UPDATE_STATE_FILE = os.path.join(BASE_DIR, "auto_update_state.json")
 DEFAULT_REQUEST_TIMEOUT = 20
 DEFAULT_DOUYIN_PROFILE_TIMEOUT = 60
 DEFAULT_AUTO_UPDATE_INTERVAL = 30
+FAIL_RECORD_FILE = os.path.join(BASE_DIR, "douyin_update_failures.json")
+DEFAULT_FAIL_THRESHOLD = 3
 
 
 @register("astrbot_plugin_juhejiexi", "Anlan", "聚合解析与抖音主页解析插件", "v1.0.0")
@@ -75,8 +77,13 @@ class MediaParserPlugin(Star):
         self.auto_update_state = self._load_auto_update_state()
         self.auto_update_task: Optional[asyncio.Task] = None
         self.auto_update_running = False
+        self.pre_check_running = False
         self.last_auto_update_date = str(self.auto_update_state.get("last_auto_update_date") or "")
         self.last_auto_update_check_date = str(self.auto_update_state.get("last_auto_update_check_date") or "")
+        self.last_pre_check_date = str(self.auto_update_state.get("last_pre_check_date") or "")
+        self.pending_update_records: Optional[List[Dict[str, Any]]] = None
+        self.instance_time_offset: int = self._init_instance_time_offset()
+        self.fail_records: Dict[str, Dict[str, Any]] = self._load_fail_records()
         self.config.save_config()
 
     async def initialize(self):
@@ -136,6 +143,9 @@ class MediaParserPlugin(Star):
     @filter.command("dyupdate")
     async def douyin_profile_update_all(self, event: AstrMessageEvent):
         """按记录顺序逐个更新已解析过的抖音主页。"""
+        if not self._is_admin_user(event):
+            yield event.plain_result("⛔ 无权限：仅白名单用户可执行此指令")
+            return
         if not self.profile_records:
             yield event.plain_result("暂无已记录的抖音主页，先使用 /dyhome 解析后再执行 /dyupdate")
             return
@@ -146,10 +156,40 @@ class MediaParserPlugin(Star):
             return
 
         total = len(self.profile_records)
-        yield event.plain_result(f"开始后台顺序更新 {total} 个抖音主页记录")
+        yield event.plain_result(f"开始更新 {total} 个抖音主页记录，请稍候…")
+        summary = self._run_profile_update_batch(douyin_profile_api_key, list(self.profile_records))
+        yield event.plain_result(summary)
 
-        for message in self._iter_profile_update_messages(douyin_profile_api_key):
-            yield event.plain_result(message)
+    @filter.command("dyretry")
+    async def douyin_profile_retry_failed(self, event: AstrMessageEvent):
+        """重试上次更新失败的抖音主页。"""
+        if not self._is_admin_user(event):
+            yield event.plain_result("⛔ 无权限：仅白名单用户可执行此指令")
+            return
+
+        failed_keys = list(self.fail_records.keys())
+        if not failed_keys:
+            yield event.plain_result("✅ 无失败记录，无需重试")
+            return
+
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
+        if not douyin_profile_api_key:
+            yield event.plain_result("未配置抖音主页解析 API 密钥")
+            return
+
+        retry_records = [
+            r for r in self.profile_records
+            if str(r.get("raw_text") or "").strip() in failed_keys
+        ]
+        if not retry_records:
+            self.fail_records.clear()
+            self._save_fail_records()
+            yield event.plain_result("✅ 失败记录已清除（对应主页记录不存在）")
+            return
+
+        yield event.plain_result(f"开始重试 {len(retry_records)} 个失败主页，请稍候…")
+        summary = self._run_profile_update_batch(douyin_profile_api_key, retry_records)
+        yield event.plain_result(summary)
 
     @filter.command("dyupdateone")
     async def douyin_profile_update_one(self, event: AstrMessageEvent):
@@ -181,6 +221,9 @@ class MediaParserPlugin(Star):
     @filter.command("dytarget")
     async def bind_auto_update_target(self, event: AstrMessageEvent):
         """绑定自动更新结果主动推送目标会话。"""
+        if not self._is_admin_user(event):
+            yield event.plain_result("⛔ 无权限：仅白名单用户可执行此指令")
+            return
         unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
         if not unified_msg_origin:
             yield event.plain_result("当前会话不支持绑定自动更新推送目标")
@@ -366,6 +409,24 @@ class MediaParserPlugin(Star):
             + "&type=1&post=mode&xz=1"
         )
 
+    def _get_pre_check_minutes(self) -> int:
+        raw = self.config.get("douyin_profile_pre_check_minutes", 30)
+        try:
+            minutes = int(raw)
+        except (TypeError, ValueError):
+            minutes = 30
+        return max(minutes, 0)
+
+    def _calc_pre_check_time(self, auto_time: str, pre_check_minutes: int) -> str:
+        """根据正式更新时间和提前分钟数，计算预检应触发的时间字符串 HH:MM。"""
+        try:
+            hour, minute = int(auto_time[:2]), int(auto_time[3:])
+            total_minutes = hour * 60 + minute - pre_check_minutes
+            total_minutes = total_minutes % (24 * 60)
+            return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+        except Exception:
+            return ""
+
     def _get_auto_update_interval(self) -> int:
         raw_interval = self.config.get("douyin_profile_auto_update_interval", DEFAULT_AUTO_UPDATE_INTERVAL)
         try:
@@ -400,6 +461,24 @@ class MediaParserPlugin(Star):
             keyword in unified_msg_origin
             for keyword in ["onebot", "v11", "aiocqhttp", "friendmessage", "groupmessage"]
         )
+
+    def _is_admin_user(self, event: AstrMessageEvent) -> bool:
+        raw_whitelist = self.config.get("admin_user_ids", [])
+        if not raw_whitelist:
+            return True
+        if isinstance(raw_whitelist, str):
+            whitelist = [item.strip() for item in raw_whitelist.replace(",", "\n").splitlines() if item.strip()]
+        elif isinstance(raw_whitelist, list):
+            whitelist = [str(item).strip() for item in raw_whitelist if str(item).strip()]
+        else:
+            whitelist = []
+        if not whitelist:
+            return True
+        try:
+            sender_id = str(event.message_obj.sender.user_id).strip()
+        except Exception:
+            sender_id = ""
+        return sender_id in whitelist
 
     def _is_onebot_event(self, event: AstrMessageEvent) -> bool:
         unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").lower()
@@ -486,10 +565,15 @@ class MediaParserPlugin(Star):
             yield event.plain_result(self._format_aggregate_summary(payload, include_image_links=False))
             if self._supports_forward_node(event):
                 node = self._build_aggregate_image_forward_node(data if isinstance(data, dict) else {}, image_urls)
-                yield event.chain_result([node])
-            else:
-                for image_url in image_urls:
-                    yield event.chain_result([Image.fromURL(image_url)])
+                try:
+                    await event.send(MessageChain([node]))
+                    return
+                except Exception as exc:
+                    logger.warning("图集合并转发发送失败，降级为逐张图片发送: %s", exc)
+                    yield event.plain_result("⚠️ 图集合并转发失败，已降级为逐张图片发送")
+
+            for image_url in image_urls:
+                yield event.chain_result([Image.fromURL(image_url)])
             return
 
         yield event.plain_result(message)
@@ -503,6 +587,25 @@ class MediaParserPlugin(Star):
             return raw_time
         return ""
 
+    def _init_instance_time_offset(self) -> int:
+        existing = self.auto_update_state.get("instance_time_offset")
+        if isinstance(existing, int) and 0 <= existing < 60:
+            return existing
+        offset = random.randint(0, 59)
+        self.auto_update_state["instance_time_offset"] = offset
+        self._save_auto_update_state()
+        logger.info("生成实例时间偏移 %s 分钟，用于多实例自动错峰", offset)
+        return offset
+
+    def _apply_time_offset(self, base_time: str, offset_minutes: int) -> str:
+        """将 HH:MM 时间字符串加上偏移分钟数后返回新的 HH:MM（跨天自动取模）。"""
+        try:
+            hour, minute = int(base_time[:2]), int(base_time[3:])
+            total = (hour * 60 + minute + offset_minutes) % (24 * 60)
+            return f"{total // 60:02d}:{total % 60:02d}"
+        except Exception:
+            return base_time
+
     async def _auto_update_loop(self):
         while True:
             try:
@@ -511,21 +614,48 @@ class MediaParserPlugin(Star):
                     await asyncio.sleep(30)
                     continue
 
+                actual_update_time = self._apply_time_offset(auto_time, self.instance_time_offset)
+                pre_check_minutes = self._get_pre_check_minutes()
+                actual_pre_check_time = (
+                    self._calc_pre_check_time(actual_update_time, pre_check_minutes)
+                    if pre_check_minutes > 0 else ""
+                )
+
                 now = datetime.now()
                 current_date = now.strftime("%Y-%m-%d")
                 current_time = now.strftime("%H:%M")
+
                 if self.last_auto_update_check_date != current_date:
                     self.last_auto_update_check_date = current_date
                     self.auto_update_state["last_auto_update_check_date"] = current_date
                     self._save_auto_update_state()
+                    logger.info(
+                        "新的一天，实际更新时间 %s（配置 %s + 偏移 %s 分钟），预检时间 %s",
+                        actual_update_time, auto_time, self.instance_time_offset,
+                        actual_pre_check_time or "不预检",
+                    )
                     await asyncio.sleep(30)
                     continue
-                if current_time >= auto_time and self.last_auto_update_date != current_date:
+
+                if (
+                    actual_pre_check_time
+                    and current_time >= actual_pre_check_time
+                    and self.last_pre_check_date != current_date
+                    and self.last_auto_update_date != current_date
+                ):
+                    self.last_pre_check_date = current_date
+                    self.auto_update_state["last_pre_check_date"] = current_date
+                    self._save_auto_update_state()
+                    logger.info("触发预检扫描（预检时间 %s）", actual_pre_check_time)
+                    await self._run_pre_check_scan()
+
+                if current_time >= actual_update_time and self.last_auto_update_date != current_date:
                     await self._run_auto_update_once()
                     self.last_auto_update_date = current_date
                     self.auto_update_state["last_auto_update_date"] = current_date
                     self.auto_update_state["last_auto_update_check_date"] = current_date
                     self._save_auto_update_state()
+
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 break
@@ -548,30 +678,178 @@ class MediaParserPlugin(Star):
 
         self.auto_update_running = True
         try:
-            total = len(self.profile_records)
+            pending = self.pending_update_records
+            if pending is not None:
+                target_records = pending
+                logger.info("使用预检缓存，本次更新 %s 个有新作品的主页（共 %s 个记录）", len(target_records), len(self.profile_records))
+            else:
+                target_records = None
+                logger.info("无预检缓存，对全部 %s 个主页记录执行更新", len(self.profile_records))
+            self.pending_update_records = None
+            total_all = len(self.profile_records)
+            total = len(target_records) if target_records is not None else total_all
             logger.info("开始执行定时自动更新，共 %s 个主页记录", total)
             success_count = 0
             failed_count = 0
+            skip_count = 0
             auto_update_interval = self._get_auto_update_interval()
-            for index, message in enumerate(self._iter_profile_update_messages(douyin_profile_api_key), start=1):
+            actual_records = list(target_records) if target_records is not None else list(self.profile_records)
+            threshold = DEFAULT_FAIL_THRESHOLD
+            replace_hints: List[str] = []
+            for index, record in enumerate(actual_records, start=1):
+                message = self._update_single_profile_record(douyin_profile_api_key, record, index=index, total=total)
+                raw_text = str(record.get("raw_text") or "").strip()
+                author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
                 if message.startswith("✅"):
                     success_count += 1
+                    if raw_text and raw_text in self.fail_records:
+                        del self.fail_records[raw_text]
+                elif message.startswith("⏭️"):
+                    skip_count += 1
+                    logger.info("自动更新跳过项: %s", message.replace("\n", " | "))
                 elif message.startswith("❌"):
                     failed_count += 1
+                    logger.info("自动更新失败项: %s", message.replace("\n", " | "))
+                    if raw_text:
+                        entry = self.fail_records.setdefault(raw_text, {"author": author, "count": 0, "last_at": ""})
+                        entry["count"] = entry.get("count", 0) + 1
+                        entry["last_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        entry["author"] = author
+                        if entry["count"] >= threshold:
+                            replace_hints.append(author)
                 else:
-                    logger.info("自动更新跳过项: %s", message.replace("\n", " | "))
+                    logger.info("自动更新其他项: %s", message.replace("\n", " | "))
                 if index < total and auto_update_interval > 0:
-                    logger.info("自动更新节流等待 %s 秒后继续下一项", auto_update_interval)
-                    await asyncio.sleep(auto_update_interval)
+                    jitter = random.uniform(auto_update_interval, auto_update_interval * 2)
+                    logger.info("自动更新节流等待 %.1f 秒后继续下一项（随机抖动 %s~%s 秒）", jitter, auto_update_interval, auto_update_interval * 2)
+                    await asyncio.sleep(jitter)
+            self._save_fail_records()
             logger.info(
-                "抖音主页自动更新全部完成：共 %s 个，成功 %s 个，失败 %s 个",
+                "抖音主页自动更新全部完成：共 %s 个，更新 %s 个，跳过 %s 个，失败 %s 个",
                 total,
                 success_count,
+                skip_count,
                 failed_count,
             )
-            await self._notify_auto_update_summary(total, success_count, failed_count)
+            await self._notify_auto_update_summary(total_all, success_count, skip_count, failed_count, replace_hints)
         finally:
             self.auto_update_running = False
+
+    async def _run_pre_check_scan(self):
+        if self.pre_check_running:
+            logger.info("预检扫描任务仍在执行，跳过本轮")
+            return
+        if not self.profile_records:
+            logger.info("预检扫描跳过：暂无主页记录")
+            return
+
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
+        if not douyin_profile_api_key:
+            logger.warning("预检扫描失败：未配置抖音主页解析 API 密钥")
+            return
+
+        self.pre_check_running = True
+        try:
+            total = len(self.profile_records)
+            logger.info("开始预检扫描，共 %s 个主页记录", total)
+            pending: List[Dict[str, Any]] = []
+            auto_update_interval = self._get_auto_update_interval()
+            for index, record in enumerate(self.profile_records, start=1):
+                raw_text = str(record.get("raw_text") or "").strip()
+                if not raw_text:
+                    continue
+                local_count = int(record.get("count") or 0)
+                remote_count = self._check_profile_count(raw_text, douyin_profile_api_key)
+                if remote_count is None or remote_count > local_count:
+                    author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
+                    logger.info(
+                        "预检 %s/%s %s：远端 %s > 本地 %s，加入待更新队列",
+                        index, total, author,
+                        remote_count if remote_count is not None else "?", local_count,
+                    )
+                    pending.append(record)
+                else:
+                    author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
+                    logger.info("预检 %s/%s %s：无新作品（%s），跳过", index, total, author, remote_count)
+                if index < total and auto_update_interval > 0:
+                    jitter = random.uniform(auto_update_interval, auto_update_interval * 2)
+                    await asyncio.sleep(jitter)
+            self.pending_update_records = pending
+            logger.info(
+                "预检扫描完成：共 %s 个，需更新 %s 个，无变化 %s 个",
+                total, len(pending), total - len(pending),
+            )
+        except Exception as exc:
+            logger.exception("预检扫描异常，将在正式更新时 fallback 全量: %s", exc)
+            self.pending_update_records = None
+        finally:
+            self.pre_check_running = False
+
+    def _run_profile_update_batch(self, douyin_profile_api_key: str, records: List[Dict[str, Any]]) -> str:
+        """同步执行一批主页更新，记录失败，返回汇总文本。"""
+        total = len(records)
+        success_count = 0
+        skip_count = 0
+        failed_authors: List[str] = []
+        threshold = DEFAULT_FAIL_THRESHOLD
+        replace_hints: List[str] = []
+
+        for index, record in enumerate(records, start=1):
+            message = self._update_single_profile_record(douyin_profile_api_key, record, index=index, total=total)
+            raw_text = str(record.get("raw_text") or "").strip()
+            author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
+            if message.startswith("✅"):
+                success_count += 1
+                if raw_text and raw_text in self.fail_records:
+                    del self.fail_records[raw_text]
+            elif message.startswith("⏭️"):
+                skip_count += 1
+            elif message.startswith("❌"):
+                failed_authors.append(author)
+                if raw_text:
+                    entry = self.fail_records.setdefault(raw_text, {"author": author, "count": 0, "last_at": ""})
+                    entry["count"] = entry.get("count", 0) + 1
+                    entry["last_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    entry["author"] = author
+                    if entry["count"] >= threshold:
+                        replace_hints.append(author)
+
+        self._save_fail_records()
+
+        lines = [
+            "📊 更新完成汇总",
+            f"📦 总数：{total}",
+            f"✔️ 成功：{success_count}",
+            f"⏭️ 跳过：{skip_count}",
+            f"❌ 失败：{len(failed_authors)}",
+        ]
+        if failed_authors:
+            lines.append("失败主页：" + "、".join(failed_authors))
+            lines.append("💡 可执行 /dyretry 重试失败主页")
+        if replace_hints:
+            lines.append("")
+            lines.append("⚠️ 以下主页连续失败 ≥{} 次，建议更换分享链接：".format(threshold))
+            for name in replace_hints:
+                lines.append(f"  · {name}")
+        return "\n".join(lines)
+
+    def _load_fail_records(self) -> Dict[str, Dict[str, Any]]:
+        if not os.path.exists(FAIL_RECORD_FILE):
+            return {}
+        try:
+            with open(FAIL_RECORD_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.warning("加载失败记录文件出错: %s", exc)
+            return {}
+
+    def _save_fail_records(self) -> None:
+        try:
+            with open(FAIL_RECORD_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.fail_records, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("保存失败记录文件出错: %s", exc)
 
     def _iter_profile_update_messages(self, douyin_profile_api_key: str, records: Optional[List[Dict[str, Any]]] = None):
         target_records = list(records) if records is not None else list(self.profile_records)
@@ -635,6 +913,7 @@ class MediaParserPlugin(Star):
             ("/dyupdate", "顺序更新全部已记录的抖音主页"),
             ("/dyupdateone", "按作者名或文件名更新单个主页记录"),
             ("/dytarget", "绑定自动更新结果的主动推送会话"),
+            ("/dyretry", "重试上次更新失败的主页"),
             ("/dymenu", "查看已保存的主页 TXT 播放菜单"),
             ("/dyplay", "按文件名播放 TXT 中的视频链接"),
             ("/dycollection", "提交点赞或收藏内容解析任务"),
@@ -649,13 +928,18 @@ class MediaParserPlugin(Star):
         saved_txt_count = len(self._list_download_txt_files())
         auto_update_enabled = "开启" if self._is_auto_update_enabled() else "关闭"
         auto_update_time = self._get_auto_update_time() or "未设置"
+        if auto_update_time != "未设置" and self.instance_time_offset != 0:
+            actual_update_time = self._apply_time_offset(auto_update_time, self.instance_time_offset)
+            auto_update_time_display = f"{auto_update_time} → 实际 {actual_update_time}（错峰偏移 {self.instance_time_offset} 分钟）"
+        else:
+            auto_update_time_display = auto_update_time
 
         lines: List[str] = [
             "┏━📘 抖音指令统计 ━┓",
             f"┃ 指令总数：{command_count}",
             f"┃ 主页记录：{tracked_profile_count}",
             f"┃ TXT 文件：{saved_txt_count}",
-            f"┃ 自动更新：{auto_update_enabled} / {auto_update_time}",
+            f"┃ 自动更新：{auto_update_enabled} / {auto_update_time_display}",
             "┣━ 指令列表",
         ]
         for command_name, description in command_definitions.items():
@@ -707,20 +991,34 @@ class MediaParserPlugin(Star):
         except Exception as exc:
             logger.warning("保存自动更新状态失败: %s", exc)
 
-    async def _notify_auto_update_summary(self, total: int, success_count: int, failed_count: int):
+    async def _notify_auto_update_summary(
+        self,
+        total: int,
+        success_count: int,
+        skip_count: int,
+        failed_count: int,
+        replace_hints: Optional[List[str]] = None,
+    ):
         unified_msg_origin = str(self.auto_update_target.get("unified_msg_origin") or "").strip()
         if not unified_msg_origin:
             return
 
         try:
-            message_chain = MessageChain([
-                Plain(
-                    f"✅ 抖音主页自动更新全部完成\n"
-                    f"📦 总数：{total}\n"
-                    f"✔️ 成功：{success_count}\n"
-                    f"❌ 失败：{failed_count}"
-                )
-            ])
+            lines = [
+                "✅ 抖音主页自动更新全部完成",
+                f"📦 总数：{total}",
+                f"✔️ 成功：{success_count}",
+                f"⏭️ 跳过（无新作品）：{skip_count}",
+                f"❌ 失败：{failed_count}",
+            ]
+            if failed_count > 0:
+                lines.append("💡 可执行 /dyretry 重试失败主页")
+            if replace_hints:
+                lines.append("")
+                lines.append(f"⚠️ 以下主页连续失败 ≥{DEFAULT_FAIL_THRESHOLD} 次，建议更换分享链接：")
+                for name in replace_hints:
+                    lines.append(f"  · {name}")
+            message_chain = MessageChain([Plain("\n".join(lines))])
             await self.context.send_message(unified_msg_origin, message_chain)
         except Exception as exc:
             logger.exception("发送自动更新汇总消息失败: %s", exc)
