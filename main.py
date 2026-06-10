@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import random
@@ -6,8 +7,8 @@ import time
 import asyncio
 from collections import OrderedDict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote, unquote
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, unquote, urljoin
 from urllib.request import Request, urlopen
 
 from astrbot.api import AstrBotConfig, logger
@@ -29,6 +30,10 @@ DOUYIN_COLLECTION_API = (
     "https://douyin.zhcnli.cn/account_cookie.php"
     "?apikey={apikey}"
 )
+DOUYIN_LOGIN_BASE_URL = "https://login.zhcnli.cn"
+DOUYIN_LOGIN_QRCODE_API = f"{DOUYIN_LOGIN_BASE_URL}/api/qrcode"
+DOUYIN_LOGIN_DOWNLOAD_API = f"{DOUYIN_LOGIN_BASE_URL}/api/download?id={{session_id}}"
+DOUYIN_LOGIN_DOWNLOAD_FILE_PATH = "/api/download/file?id={session_id}"
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 AUTO_PARSE_HOST_KEYWORDS = (
     "douyin.com",
@@ -60,6 +65,7 @@ AUTO_UPDATE_TARGET_FILE = os.path.join(BASE_DIR, "auto_update_target.json")
 AUTO_UPDATE_STATE_FILE = os.path.join(BASE_DIR, "auto_update_state.json")
 DEFAULT_REQUEST_TIMEOUT = 20
 DEFAULT_DOUYIN_PROFILE_TIMEOUT = 60
+DEFAULT_DOUYIN_LOGIN_TIMEOUT = 120
 DEFAULT_AUTO_UPDATE_INTERVAL = 30
 FAIL_RECORD_FILE = os.path.join(BASE_DIR, "douyin_update_failures.json")
 DEFAULT_FAIL_THRESHOLD = 3
@@ -72,6 +78,7 @@ class MediaParserPlugin(Star):
         self.config = config
         self.play_indexes: Dict[str, int] = {}
         self.play_history: Dict[str, List[int]] = {}
+        self.random_profile_index: int = 0
         self.profile_records: List[Dict[str, Any]] = self._load_profile_records()
         self.auto_update_target = self._load_auto_update_target()
         self.auto_update_state = self._load_auto_update_state()
@@ -126,6 +133,7 @@ class MediaParserPlugin(Star):
             yield event.plain_result("未配置抖音主页解析 API 密钥")
             return
 
+        yield event.plain_result("正在解析，请稍候…")
         try:
             api_url = self._build_douyin_profile_api(raw_text, douyin_profile_api_key)
             profile_timeout = self._get_douyin_profile_timeout()
@@ -156,7 +164,7 @@ class MediaParserPlugin(Star):
             return
 
         total = len(self.profile_records)
-        yield event.plain_result(f"开始更新 {total} 个抖音主页记录，请稍候…")
+        yield event.plain_result(f"正在解析，请稍候…\n开始更新 {total} 个抖音主页记录")
         summary = self._run_profile_update_batch(douyin_profile_api_key, list(self.profile_records))
         yield event.plain_result(summary)
 
@@ -187,7 +195,7 @@ class MediaParserPlugin(Star):
             yield event.plain_result("✅ 失败记录已清除（对应主页记录不存在）")
             return
 
-        yield event.plain_result(f"开始重试 {len(retry_records)} 个失败主页，请稍候…")
+        yield event.plain_result(f"正在解析，请稍候…\n开始重试 {len(retry_records)} 个失败主页")
         summary = self._run_profile_update_batch(douyin_profile_api_key, retry_records)
         yield event.plain_result(summary)
 
@@ -214,7 +222,7 @@ class MediaParserPlugin(Star):
             return
 
         display_name = str(matched_record.get("author") or matched_record.get("file_name") or keyword).strip()
-        yield event.plain_result(f"开始更新：{display_name}")
+        yield event.plain_result(f"正在解析，请稍候…\n开始更新：{display_name}")
         result_message = self._update_single_profile_record(douyin_profile_api_key, matched_record, index=1, total=1)
         yield event.plain_result(result_message)
 
@@ -315,6 +323,46 @@ class MediaParserPlugin(Star):
         ]
         yield event.chain_result(message_chain)
 
+    @filter.command("dyrand")
+    async def douyin_profile_random_play(self, event: AstrMessageEvent):
+        """每次切换到下一个主页 TXT，并随机播放其中一个视频。"""
+        txt_files = self._list_download_txt_files()
+        if not txt_files:
+            yield event.plain_result("暂无可播放的主页记录，先用 /dyhome 解析主页")
+            return
+
+        current_index = self.random_profile_index % len(txt_files)
+        file_name = txt_files[current_index]
+        self.random_profile_index = (current_index + 1) % len(txt_files)
+        file_path = os.path.join(DOWNLOAD_DIR, file_name)
+
+        urls = self._load_profile_play_urls(file_path)
+        checked_count = 1
+        while not urls and checked_count < len(txt_files):
+            current_index = self.random_profile_index % len(txt_files)
+            file_name = txt_files[current_index]
+            self.random_profile_index = (current_index + 1) % len(txt_files)
+            file_path = os.path.join(DOWNLOAD_DIR, file_name)
+            urls = self._load_profile_play_urls(file_path)
+            checked_count += 1
+
+        if not urls:
+            yield event.plain_result("所有主页 TXT 文件都为空，暂无可播放视频")
+            return
+
+        video_index = self._pick_random_play_index(file_path, len(urls))
+        playable_url = self._resolve_direct_media_url(urls[video_index])
+        message_chain = [
+            Plain(
+                f"🎲 随机播放主页：{file_name}\n"
+                f"📍 主页进度：{current_index + 1}/{len(txt_files)}\n"
+                f"🎬 视频序号：{video_index + 1}/{len(urls)}\n"
+                f"🔗 视频直链：{playable_url}"
+            ),
+            Video.fromURL(playable_url),
+        ]
+        yield event.chain_result(message_chain)
+
     @filter.command("dycollection")
     async def douyin_collection_parse(self, event: AstrMessageEvent):
         """抖音点赞/收藏解析：基于已配置的账号 Cookie 提交后台任务。"""
@@ -337,6 +385,7 @@ class MediaParserPlugin(Star):
 
         filename = self._build_account_export_filename(mode)
         email = str(self.config.get("collection_email", "") or "").strip()
+        yield event.plain_result("正在解析，请稍候…")
         try:
             submit_api = self._build_account_cookie_submit_api(douyin_profile_api_key, cookie, mode, filename, email)
             payload = self._request_json(submit_api, timeout=self._get_douyin_profile_timeout())
@@ -360,6 +409,7 @@ class MediaParserPlugin(Star):
             yield event.plain_result("未配置抖音主页解析 API 密钥")
             return
 
+        yield event.plain_result("正在解析，请稍候…")
         try:
             query_api = self._build_account_cookie_query_api(douyin_profile_api_key, job_id)
             payload = self._request_json(query_api, timeout=self._get_douyin_profile_timeout())
@@ -369,6 +419,29 @@ class MediaParserPlugin(Star):
             return
 
         yield event.plain_result(self._format_account_cookie_query_result(payload, job_id))
+
+    @filter.command("dyck")
+    async def douyin_cookie_login(self, event: AstrMessageEvent):
+        """生成抖音登录二维码，并返回登录成功后的 Cookie 下载链接。"""
+        try:
+            payload = self._request_json(DOUYIN_LOGIN_QRCODE_API, timeout=DEFAULT_DOUYIN_LOGIN_TIMEOUT)
+            session_id, qrcode_path = self._save_douyin_login_qrcode(payload)
+            download_url = self._build_douyin_login_download_file_url(session_id)
+        except Exception as exc:
+            logger.exception("抖音 Cookie 登录二维码生成失败: %s", exc)
+            yield event.plain_result(f"抖音 Cookie 登录二维码生成失败：{exc}")
+            return
+
+        text_before = (
+            "请尽快使用抖音扫码登录，登录成功后访问下方链接下载 Cookie。\n"
+            f"会话ID：{session_id}\n"
+        )
+        text_after = f"\nCookie 下载链接：{download_url}"
+        yield event.chain_result([
+            Plain(text_before),
+            Image.fromFileSystem(qrcode_path),
+            Plain(text_after),
+        ])
 
     @filter.command("dyhelp")
     async def douyin_help(self, event: AstrMessageEvent):
@@ -408,6 +481,74 @@ class MediaParserPlugin(Star):
             + quote(raw_text, safe="")
             + "&type=1&post=mode&xz=1"
         )
+
+    def _save_douyin_login_qrcode(self, payload: Dict[str, Any]) -> Tuple[str, str]:
+        code = payload.get("code")
+        if code not in (0, "0", None):
+            message = str(payload.get("message") or "接口返回失败")
+            raise ValueError(message)
+
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("二维码接口返回格式异常")
+
+        session_id = str(data.get("session_id") or "").strip()
+        if not session_id:
+            raise ValueError("二维码接口未返回会话ID")
+
+        qrcode_base64 = self._extract_qrcode_base64(data)
+        try:
+            image_bytes = base64.b64decode(qrcode_base64, validate=True)
+        except Exception as exc:
+            raise ValueError("二维码 Base64 解码失败") from exc
+
+        if not image_bytes:
+            raise ValueError("二维码图片内容为空")
+
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        qrcode_path = os.path.join(DOWNLOAD_DIR, f"douyin_login_{session_id}.png")
+        with open(qrcode_path, "wb") as file:
+            file.write(image_bytes)
+        return session_id, qrcode_path
+
+    def _extract_qrcode_base64(self, data: Dict[str, Any]) -> str:
+        qrcode = str(data.get("qrcode") or "").strip()
+        qrcode_uri = str(data.get("qrcode_uri") or "").strip()
+        raw_qrcode = qrcode or qrcode_uri
+        if not raw_qrcode:
+            raise ValueError("二维码接口未返回图片内容")
+
+        if raw_qrcode.startswith("data:image") and "," in raw_qrcode:
+            raw_qrcode = raw_qrcode.split(",", 1)[1]
+        return re.sub(r"\s+", "", raw_qrcode)
+
+    def _get_douyin_login_download_url(self, session_id: str) -> str:
+        fallback_url = self._build_douyin_login_download_file_url(session_id)
+        try:
+            payload = self._request_json(
+                DOUYIN_LOGIN_DOWNLOAD_API.format(session_id=quote(session_id, safe="")),
+                timeout=DEFAULT_DOUYIN_LOGIN_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning("获取抖音 Cookie 下载链接失败，使用默认拼装链接: %s", exc)
+            return fallback_url
+
+        download_url = self._extract_douyin_login_download_url(payload)
+        return download_url or fallback_url
+
+    def _extract_douyin_login_download_url(self, payload: Dict[str, Any]) -> str:
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return ""
+
+        relative_url = str(data.get("download_url") or data.get("file_url") or "").strip()
+        if not relative_url:
+            return ""
+        return urljoin(DOUYIN_LOGIN_BASE_URL, relative_url)
+
+    def _build_douyin_login_download_file_url(self, session_id: str) -> str:
+        relative_url = DOUYIN_LOGIN_DOWNLOAD_FILE_PATH.format(session_id=quote(session_id, safe=""))
+        return urljoin(DOUYIN_LOGIN_BASE_URL, relative_url)
 
     def _get_pre_check_minutes(self) -> int:
         raw = self.config.get("douyin_profile_pre_check_minutes", 30)
@@ -490,7 +631,7 @@ class MediaParserPlugin(Star):
         if lowered_text.startswith("/"):
             return False
 
-        if lowered_text.startswith(("jx ", "dyhome", "dyupdate", "dyupdateone", "dytarget", "dytrack", "dymenu", "dyplay", "dycollection", "dycollection_query", "dyhelp")):
+        if lowered_text.startswith(("jx ", "dyhome", "dyupdate", "dyupdateone", "dytarget", "dytrack", "dymenu", "dyplay", "dyrand", "dycollection", "dycollection_query", "dyck", "dyhelp")):
             return False
 
         target_url = self._extract_url(text)
@@ -519,9 +660,13 @@ class MediaParserPlugin(Star):
                 yield event.plain_result("未配置聚合解析 API 密钥")
             return
 
+        yield event.plain_result("正在解析，请稍候…")
         try:
             api_url = AGGREGATE_API.format(apikey=quote(aggregate_api_key, safe="")) + quote(target_url, safe="")
             payload = self._request_json(api_url)
+            data = payload.get("data")
+            if isinstance(data, dict):
+                data["raw_share_url"] = target_url
         except Exception as exc:
             logger.exception("聚合解析失败: %s", exc)
             if require_command:
@@ -532,6 +677,9 @@ class MediaParserPlugin(Star):
         message = self._format_aggregate_result(payload)
         video_url = self._pick_video_url(data) if isinstance(data, dict) else None
         image_urls = self._pick_image_urls(data) if isinstance(data, dict) else []
+        live_video_urls = self._pick_live_video_urls(data) if isinstance(data, dict) else []
+        if isinstance(data, dict) and self._is_live_resource(data) and live_video_urls:
+            image_urls = []
 
         if video_url:
             playable_url = self._resolve_direct_media_url(video_url)
@@ -539,10 +687,13 @@ class MediaParserPlugin(Star):
             yield event.chain_result([Video.fromURL(playable_url)])
             return
 
-        if image_urls:
+        if image_urls or live_video_urls:
             yield event.plain_result(self._format_aggregate_summary(payload, include_image_links=False))
             for image_url in image_urls:
-                yield event.image_result(image_url)
+                yield event.image_result(self._compress_image_url(image_url))
+            for live_video_url in live_video_urls:
+                playable_url = self._resolve_direct_media_url(live_video_url)
+                yield event.chain_result([Video.fromURL(playable_url)])
             return
 
         yield event.plain_result(message)
@@ -885,8 +1036,10 @@ class MediaParserPlugin(Star):
             ("/dyretry", "重试上次更新失败的主页"),
             ("/dymenu", "查看已保存的主页 TXT 播放菜单"),
             ("/dyplay", "按文件名播放 TXT 中的视频链接"),
+            ("/dyrand", "轮流切换主页并随机播放其中一个视频"),
             ("/dycollection", "提交点赞或收藏内容解析任务"),
             ("/dycollection_query", "查询点赞或收藏解析任务状态"),
+            ("/dyck", "生成抖音登录二维码并返回 Cookie 下载链接"),
             ("/dyhelp", "查看抖音指令帮助与统计"),
         ])
 
@@ -894,7 +1047,14 @@ class MediaParserPlugin(Star):
         command_definitions = self._get_douyin_command_definitions()
         command_count = len(command_definitions)
         tracked_profile_count = len(self.profile_records)
-        saved_txt_count = len(self._list_download_txt_files())
+        txt_files = self._list_download_txt_files()
+        saved_txt_count = len(txt_files)
+        play_mode = str(self.config.get("douyin_profile_play_mode", "sequential") or "sequential").strip().lower()
+        play_mode_display = "随机" if play_mode == "random" else "顺序"
+        next_random_profile = "暂无"
+        if txt_files:
+            next_index = self.random_profile_index % len(txt_files)
+            next_random_profile = os.path.splitext(txt_files[next_index])[0]
         auto_update_enabled = "开启" if self._is_auto_update_enabled() else "关闭"
         auto_update_time = self._get_auto_update_time() or "未设置"
         if auto_update_time != "未设置" and self.instance_time_offset != 0:
@@ -908,6 +1068,8 @@ class MediaParserPlugin(Star):
             f"┃ 指令总数：{command_count}",
             f"┃ 主页记录：{tracked_profile_count}",
             f"┃ TXT 文件：{saved_txt_count}",
+            f"┃ /dyplay 模式：{play_mode_display}",
+            f"┃ /dyrand 下个主页：{next_random_profile}",
             f"┃ 自动更新：{auto_update_enabled} / {auto_update_time_display}",
             "┣━ 指令列表",
         ]
@@ -1270,33 +1432,81 @@ class MediaParserPlugin(Star):
         lines: List[str] = [f"✅ 解析成功：{payload.get('msg', '成功')}"]
         lines.append(f"🌐 平台：{platform}")
 
-        author = data.get("author")
-        title = data.get("title")
+        author = self._format_aggregate_author(data.get("author"))
+        title = str(data.get("title") or data.get("desc") or "").strip()
+        resource_type = str(data.get("type") or "").strip().lower()
+        if resource_type:
+            display_type = "live_video" if self._is_live_resource(data) and self._pick_live_video_urls(data) else resource_type
+            lines.append(f"📌 类型：{display_type}")
         if author:
-            lines.append(f"👤 作者：{self._normalize_author_name(str(author))}")
+            lines.append(f"👤 作者：{author}")
         if title:
             lines.append(f"📝 标题：{title}")
 
         video_url = self._pick_video_url(data)
         image_urls = self._pick_image_urls(data)
+        live_video_urls = self._pick_live_video_urls(data)
+        if self._is_live_resource(data) and live_video_urls:
+            image_urls = []
+        live_photo_count = self._count_live_photos(data)
+        backup_count = self._count_video_backups(data)
         image_count = len(image_urls)
+        video_count = (1 if video_url else 0) + len(live_video_urls)
 
-        if video_url or image_urls:
+        if video_url or image_urls or live_video_urls:
             lines.append("📦 资源概览：")
-            lines.append(f"- 视频：{'1 个' if video_url else '0 个'}")
+            lines.append(f"- 视频：{video_count} 个")
             lines.append(f"- 图片：{image_count} 张")
+            if live_photo_count:
+                lines.append(f"- 实况：{live_photo_count} 个")
+            if backup_count:
+                lines.append(f"- 备份画质：{backup_count} 个")
 
         if video_url:
             lines.append("🎬 视频链接：")
             lines.append(video_url)
+        if live_video_urls:
+            lines.append("🎬 实况视频链接：")
+            lines.extend([f"{index}. {item}" for index, item in enumerate(live_video_urls, start=1)])
         if image_urls and include_image_links:
             lines.append("🖼️ 图片链接：")
             lines.extend([f"{index}. {item}" for index, item in enumerate(image_urls, start=1)])
 
-        if not video_url and not image_urls:
+        if not video_url and not image_urls and not live_video_urls:
             return "⚠️ 聚合解析完成，但未找到视频或图片链接"
 
         return "\n".join(lines)
+
+    def _format_aggregate_author(self, author: Any) -> str:
+        if isinstance(author, dict):
+            name = str(author.get("name") or author.get("nickname") or "").strip()
+            author_id = str(author.get("id") or author.get("uid") or author.get("user_id") or "").strip()
+            display_name = self._normalize_author_name(name) or name
+            if display_name and author_id:
+                return f"{display_name}（{author_id}）"
+            return display_name or author_id
+
+        if isinstance(author, str):
+            return self._normalize_author_name(author) or author.strip()
+        return ""
+
+    def _count_video_backups(self, data: Dict[str, Any]) -> int:
+        video_backup = data.get("video_backup")
+        return len(video_backup) if isinstance(video_backup, list) else 0
+
+    def _count_live_photos(self, data: Dict[str, Any]) -> int:
+        live_photo = data.get("live_photo")
+        if isinstance(live_photo, list):
+            return len(live_photo)
+
+        live_photos = data.get("livePhotos")
+        if isinstance(live_photos, list):
+            return len(live_photos)
+
+        images = data.get("images")
+        if isinstance(images, list):
+            return sum(1 for item in images if isinstance(item, dict) and item.get("livePhoto"))
+        return 0
 
     def _format_douyin_profile_result(self, payload: Dict[str, Any], download_info: Optional[Dict[str, str]] = None) -> str:
         code = payload.get("code")
@@ -1382,7 +1592,14 @@ class MediaParserPlugin(Star):
                 row_items.append(f"{icon} {name}")
             rows.append("  ".join(row_items))
 
-        lines: List[str] = ["┏━🎵 抖音主页菜单 ━┓", *rows, "┣━ 使用方法", "┃ /dyplay 猫姨", "┗━━━━━━━━━━━━━━┛"]
+        lines: List[str] = [
+            "┏━🎵 抖音主页菜单 ━┓",
+            *rows,
+            "┣━ 使用方法",
+            "┃ /dyplay 猫姨",
+            "┃ /dyrand 随机播放下一个主页",
+            "┗━━━━━━━━━━━━━━┛",
+        ]
         return "\n".join(lines)
 
     def _sanitize_file_name(self, value: str) -> str:
@@ -1415,6 +1632,14 @@ class MediaParserPlugin(Star):
         elif cleaned_text.startswith("dyupdateone"):
             cleaned_text = cleaned_text[len("dyupdateone"):].strip()
         return cleaned_text or None
+
+    def _load_profile_play_urls(self, file_path: str) -> List[str]:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+                return [line.strip() for line in file if line.strip()]
+        except Exception as exc:
+            logger.warning("读取抖音主页播放文件失败: %s", exc)
+            return []
 
     def _find_download_txt(self, file_key: str) -> Optional[str]:
         normalized = self._sanitize_file_name(file_key)
@@ -1566,8 +1791,16 @@ class MediaParserPlugin(Star):
 
     def _detect_platform(self, data: Dict[str, Any]) -> str:
         url_text = " ".join(self._collect_candidate_urls(data)).lower()
-        if "qianwen" in url_text or "quark-aistudio" in url_text:
+        if "activity.qianwen.com" in url_text or "ai-studio-mobile" in url_text or "qwen-share" in url_text:
+            return "通义千问 AI Studio"
+        if "qianwen.com/share/chat" in url_text or "qianwen.com" in url_text:
             return "通义千问"
+        if "quark-aistudio" in url_text:
+            return "通义千问 AI Studio"
+        if "doubao.com" in url_text:
+            return "豆包"
+        if "jimeng.jianying.com" in url_text or "capcut.cn" in url_text:
+            return "即梦"
         if "douyin" in url_text or "aweme" in url_text:
             return "抖音"
         if "kuaishou" in url_text or "yximgs" in url_text or "djvod" in url_text:
@@ -1584,8 +1817,29 @@ class MediaParserPlugin(Star):
 
     def _pick_video_url(self, data: Dict[str, Any]) -> Optional[str]:
         resource_type = str(data.get("type") or "").strip().lower()
-        if resource_type in {"image", "images", "photo", "album", "gallery", "img"}:
+        if resource_type in {"image", "images", "photo", "album", "gallery", "img", "live"}:
             return None
+
+        primary_url = data.get("url")
+        if self._is_probable_video_url(primary_url):
+            return primary_url
+
+        video_backup = data.get("video_backup")
+        if isinstance(video_backup, list):
+            sorted_backups = sorted(
+                [item for item in video_backup if isinstance(item, dict)],
+                key=lambda item: (
+                    self._safe_int(item.get("quality_type")),
+                    self._safe_int(item.get("height")),
+                    self._safe_int(item.get("width")),
+                    self._safe_int(item.get("bit_rate")),
+                ),
+                reverse=True,
+            )
+            for item in sorted_backups:
+                candidate_url = item.get("url")
+                if self._is_probable_video_url(candidate_url):
+                    return candidate_url
 
         raw_payload = data.get("raw") if isinstance(data.get("raw"), dict) else {}
         raw_media = raw_payload.get("media") if isinstance(raw_payload.get("media"), list) else []
@@ -1628,7 +1882,6 @@ class MediaParserPlugin(Star):
             data.get("source_url"),
             data.get("video"),
             data.get("video_url"),
-            data.get("url"),
         ]
         for item in candidates:
             if self._is_probable_video_url(item):
@@ -1658,8 +1911,69 @@ class MediaParserPlugin(Star):
 
         return True
 
+    def _is_live_resource(self, data: Dict[str, Any]) -> bool:
+        resource_type = str(data.get("type") or "").strip().lower()
+        if resource_type in {"live", "live_photo", "livephoto", "实况"}:
+            return True
+
+        live_photos = data.get("livePhotos")
+        if isinstance(live_photos, list) and live_photos:
+            return True
+
+        images = data.get("images")
+        if isinstance(images, list):
+            return any(isinstance(item, dict) and item.get("livePhoto") for item in images)
+        return False
+
+    def _compress_image_url(self, url: str) -> str:
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            return url
+
+        lowered_url = url.lower()
+        if "xiaohongshu.com" not in lowered_url and "xhscdn" not in lowered_url:
+            return url
+
+        clean_url = re.sub(r"imageView2/2/w/\d+(?:/format/[a-z0-9]+)?", "imageView2/2/w/1080/format/jpg", url, flags=re.IGNORECASE)
+        if clean_url == url:
+            separator = "&" if "?" in clean_url else "?"
+            clean_url = f"{clean_url}{separator}imageView2/2/w/1080/format/jpg"
+        return clean_url
+
+    def _pick_live_video_urls(self, data: Dict[str, Any]) -> List[str]:
+        candidates: List[str] = []
+        for key in ["live_photo", "livePhotos", "images"]:
+            value = data.get(key)
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                if key == "images" and not item.get("livePhoto"):
+                    continue
+                video_url = item.get("video")
+                if self._is_probable_video_url(video_url):
+                    candidates.append(video_url)
+
+        unique_candidates: List[str] = []
+        seen = set()
+        for item in candidates:
+            if item in seen:
+                continue
+            seen.add(item)
+            unique_candidates.append(item)
+        return unique_candidates
+
     def _pick_image_urls(self, data: Dict[str, Any]) -> List[str]:
         candidates: List[str] = []
+
+        live_photo = data.get("live_photo")
+        if isinstance(live_photo, list):
+            for item in live_photo:
+                if not isinstance(item, dict):
+                    continue
+                image_url = item.get("image")
+                if isinstance(image_url, str) and image_url.startswith(("http://", "https://")):
+                    candidates.append(image_url)
 
         raw_payload = data.get("raw") if isinstance(data.get("raw"), dict) else {}
         raw_media = raw_payload.get("media") if isinstance(raw_payload.get("media"), list) else []
@@ -1674,7 +1988,7 @@ class MediaParserPlugin(Star):
                 if isinstance(candidate_url, str) and candidate_url.startswith(("http://", "https://")):
                     candidates.append(candidate_url)
 
-        for key in ["images", "image", "imgurl", "image_urls", "pics"]:
+        for key in ["images", "image", "imgurl", "image_urls", "pics", "cover"]:
             value = data.get(key)
             if isinstance(value, list):
                 for item in value:
@@ -1691,7 +2005,10 @@ class MediaParserPlugin(Star):
         urls = data.get("urls")
         if isinstance(urls, list):
             candidates.extend(
-                item for item in urls if isinstance(item, str) and item.startswith(("http://", "https://"))
+                item for item in urls
+                if isinstance(item, str)
+                and item.startswith(("http://", "https://"))
+                and not self._is_probable_video_url(item)
             )
 
         unique_candidates: List[str] = []
@@ -1710,7 +2027,11 @@ class MediaParserPlugin(Star):
             if isinstance(value, str) and value.startswith(("http://", "https://")):
                 urls.append(value)
             elif isinstance(value, list):
-                urls.extend(item for item in value if isinstance(item, str))
+                for item in value:
+                    if isinstance(item, str) and item.startswith(("http://", "https://")):
+                        urls.append(item)
+                    elif isinstance(item, dict):
+                        urls.extend(self._collect_candidate_urls(item))
             elif isinstance(value, dict):
                 urls.extend(self._collect_candidate_urls(value))
         return urls
