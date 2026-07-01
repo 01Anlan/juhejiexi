@@ -726,25 +726,16 @@ class MediaParserPlugin(Star):
     def _build_forward_nodes(self, summary: str, image_urls: List[str], fallback_name: str) -> List[Node]:
         uin = self._get_forward_node_uin()
         name = self._get_forward_node_name(fallback_name)
-        nodes: List[Node] = [
+        content = [Plain(summary)]
+        for image_url in image_urls:
+            content.append(Image.fromURL(self._compress_image_url(image_url)))
+        return [
             Node(
                 uin=uin,
                 name=name,
-                content=[Plain(summary)],
+                content=content,
             )
         ]
-        for index, image_url in enumerate(image_urls, start=1):
-            nodes.append(
-                Node(
-                    uin=uin,
-                    name=name,
-                    content=[
-                        Plain(f"图片 {index}/{len(image_urls)}"),
-                        Image.fromURL(self._compress_image_url(image_url)),
-                    ],
-                )
-            )
-        return nodes
 
     def _is_admin_user(self, event: AstrMessageEvent) -> bool:
         raw_whitelist = self.config.get("admin_user_ids", [])
