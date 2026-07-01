@@ -5,11 +5,17 @@ import random
 import re
 import time
 import asyncio
+import importlib.util
+import sys
 from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote, urljoin
 from urllib.request import Request, urlopen
+
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -91,12 +97,21 @@ class MediaParserPlugin(Star):
         self.pending_update_records: Optional[List[Dict[str, Any]]] = None
         self.instance_time_offset: int = self._init_instance_time_offset()
         self.fail_records: Dict[str, Dict[str, Any]] = self._load_fail_records()
+        self.api_http_server = None
+        self.api_server_thread = None
+        self.api_running = False
         self.config.save_config()
 
     async def initialize(self):
         logger.info("media_parser 插件已初始化")
         if not self.auto_update_task or self.auto_update_task.done():
             self.auto_update_task = asyncio.create_task(self._auto_update_loop())
+        if self.config.get("api_auto_start", False):
+            try:
+                self._start_api_server()
+                logger.info("API 服务已自动启动")
+            except Exception as exc:
+                logger.exception("API 服务自动启动失败: %s", exc)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def auto_aggregate_parse_for_onebot(self, event: AstrMessageEvent):
@@ -239,6 +254,12 @@ class MediaParserPlugin(Star):
 
         self.auto_update_target = {"unified_msg_origin": unified_msg_origin}
         self._save_auto_update_target()
+        if self._is_auto_update_push_unsupported_origin(unified_msg_origin):
+            yield event.plain_result(
+                "⚠️ 已记录当前会话，但当前 QQ 官方 Webhook 适配器暂不支持插件主动推送\n"
+                "📌 定时自动更新仍会正常执行，汇总结果会写入插件日志"
+            )
+            return
         yield event.plain_result(
             "✅ 已绑定自动更新推送会话\n"
             "📌 后续定时自动更新完成后，会主动向当前会话发送一条汇总消息"
@@ -326,42 +347,72 @@ class MediaParserPlugin(Star):
     @filter.command("dyrand")
     async def douyin_profile_random_play(self, event: AstrMessageEvent):
         """每次切换到下一个主页 TXT，并随机播放其中一个视频。"""
-        txt_files = self._list_download_txt_files()
-        if not txt_files:
+        result = self._get_dyrand_data()
+        if result is None:
             yield event.plain_result("暂无可播放的主页记录，先用 /dyhome 解析主页")
             return
 
-        current_index = self.random_profile_index % len(txt_files)
-        file_name = txt_files[current_index]
-        self.random_profile_index = (current_index + 1) % len(txt_files)
-        file_path = os.path.join(DOWNLOAD_DIR, file_name)
-
-        urls = self._load_profile_play_urls(file_path)
-        checked_count = 1
-        while not urls and checked_count < len(txt_files):
-            current_index = self.random_profile_index % len(txt_files)
-            file_name = txt_files[current_index]
-            self.random_profile_index = (current_index + 1) % len(txt_files)
-            file_path = os.path.join(DOWNLOAD_DIR, file_name)
-            urls = self._load_profile_play_urls(file_path)
-            checked_count += 1
-
-        if not urls:
-            yield event.plain_result("所有主页 TXT 文件都为空，暂无可播放视频")
-            return
-
-        video_index = self._pick_random_play_index(file_path, len(urls))
-        playable_url = self._resolve_direct_media_url(urls[video_index])
         message_chain = [
             Plain(
-                f"🎲 随机播放主页：{file_name}\n"
-                f"📍 主页进度：{current_index + 1}/{len(txt_files)}\n"
-                f"🎬 视频序号：{video_index + 1}/{len(urls)}\n"
-                f"🔗 视频直链：{playable_url}"
+                f"🎲 随机播放主页：{result['file_name']}\n"
+                f"📍 主页进度：{result['profile_index'] + 1}/{result['total_profiles']}\n"
+                f"🎬 视频序号：{result['video_index'] + 1}/{result['total_videos']}\n"
+                f"🔗 视频直链：{result['playable_url']}"
             ),
-            Video.fromURL(playable_url),
+            Video.fromURL(result["playable_url"]),
         ]
         yield event.chain_result(message_chain)
+
+    @filter.command("dyapi_on")
+    async def api_server_start(self, event: AstrMessageEvent):
+        """开启 HTTP API 服务，通过接口获取随机视频数据。"""
+        if not self._is_admin_user(event):
+            yield event.plain_result("⛔ 无权限：仅白名单用户可执行此指令")
+            return
+
+        if self.api_running:
+            yield event.plain_result("⚠️ API 服务已在运行中\n" + self._format_api_status())
+            return
+
+        try:
+            self._start_api_server()
+            yield event.plain_result(
+                "✅ API 服务已启动\n"
+                + self._format_api_status()
+                + "\n📌 接口说明：\n"
+                + "  /api?type=json  - 返回 JSON 格式随机视频数据\n"
+                + "  /api?type=text  - 返回纯文本随机视频信息\n"
+                + "  /api?type=video - 302 重定向到视频直链"
+            )
+        except Exception as exc:
+            logger.exception("启动 API 服务失败: %s", exc)
+            yield event.plain_result(f"❌ API 服务启动失败：{exc}")
+
+    @filter.command("dyapi_off")
+    async def api_server_stop(self, event: AstrMessageEvent):
+        """关闭 HTTP API 服务。"""
+        if not self._is_admin_user(event):
+            yield event.plain_result("⛔ 无权限：仅白名单用户可执行此指令")
+            return
+
+        if not self.api_running:
+            yield event.plain_result("⚠️ API 服务未在运行")
+            return
+
+        try:
+            self._stop_api_server()
+            yield event.plain_result("✅ API 服务已关闭")
+        except Exception as exc:
+            logger.exception("关闭 API 服务失败: %s", exc)
+            yield event.plain_result(f"❌ API 服务关闭失败：{exc}")
+
+    @filter.command("dyapi_status")
+    async def api_server_status(self, event: AstrMessageEvent):
+        """查看 HTTP API 服务状态与本机连通性诊断。"""
+        if not self._is_admin_user(event):
+            yield event.plain_result("⛔ 无权限：仅白名单用户可执行此指令")
+            return
+        yield event.plain_result(self._format_api_status())
 
     @filter.command("dycollection")
     async def douyin_collection_parse(self, event: AstrMessageEvent):
@@ -443,10 +494,90 @@ class MediaParserPlugin(Star):
             Plain(text_after),
         ])
 
+    @filter.command("画")
+    async def ark_image_generate(self, event: AstrMessageEvent):
+        """火山方舟文生图：/画 prompt描述。"""
+        async for result in self._handle_ark_image_generate(event):
+            yield result
+
+    @filter.command("draw")
+    async def ark_image_generate_alias(self, event: AstrMessageEvent):
+        """火山方舟文生图英文别名：/draw prompt描述。"""
+        async for result in self._handle_ark_image_generate(event):
+            yield result
+
+    @filter.command("arkdiag")
+    async def ark_diagnostics(self, event: AstrMessageEvent):
+        """检查 AstrBot 当前运行环境中的火山方舟 SDK 导入状态。"""
+        yield event.plain_result(self._format_ark_diagnostics())
+
     @filter.command("dyhelp")
     async def douyin_help(self, event: AstrMessageEvent):
         """显示抖音相关指令帮助与统计。"""
         yield event.plain_result(self._format_dyhelp())
+
+    async def _handle_ark_image_generate(self, event: AstrMessageEvent):
+        prompt = self._extract_draw_prompt(event.message_str)
+        if not prompt:
+            yield event.plain_result("用法：/画 prompt描述；发送或引用单张图片时会自动图生图")
+            return
+
+        api_key = str(self.config.get("ark_api_key", "") or "").strip()
+        if not api_key:
+            yield event.plain_result("未配置火山方舟 API Key")
+            return
+
+        input_image_url = self._extract_event_image_url(event)
+        yield event.plain_result("正在画图，请稍候…")
+        try:
+            image_url = await asyncio.to_thread(self._generate_ark_image_url, prompt, api_key, input_image_url)
+        except Exception as exc:
+            logger.exception("火山方舟画图失败: %s", exc)
+            yield event.plain_result(f"画图失败：{exc}")
+            return
+
+        mode_label = "图生图" if input_image_url else "文生图"
+        result_text = f"✅ {mode_label}完成\n📝 提示词：{prompt}\n图片链接：{image_url}"
+        if input_image_url:
+            result_text += f"\n参考图：{input_image_url}"
+        yield event.plain_result(result_text)
+        yield event.image_result(image_url)
+
+    def _generate_ark_image_url(self, prompt: str, api_key: str, input_image_url: Optional[str] = None) -> str:
+        try:
+            from volcenginesdkarkruntime import Ark
+        except Exception as exc:
+            raise RuntimeError(self._format_ark_import_error(exc)) from exc
+
+        base_url = str(self.config.get("ark_base_url", "") or "https://ark.cn-beijing.volces.com/api/v3").strip()
+        model = str(self.config.get("ark_image_model", "") or "doubao-seedream-5-0-260128").strip()
+        size = str(self.config.get("ark_image_size", "") or "2K").strip()
+        watermark = bool(self.config.get("ark_image_watermark", True))
+
+        request_args = {
+            "model": model,
+            "prompt": prompt,
+            "sequential_image_generation": "disabled",
+            "response_format": "url",
+            "size": size,
+            "stream": False,
+            "watermark": watermark,
+        }
+        if input_image_url:
+            request_args["image"] = input_image_url
+
+        client = Ark(base_url=base_url, api_key=api_key)
+        response = client.images.generate(**request_args)
+
+        data = getattr(response, "data", None)
+        if not data:
+            raise ValueError("方舟接口未返回图片数据")
+
+        first_item = data[0]
+        image_url = str(getattr(first_item, "url", "") or "").strip()
+        if not image_url:
+            raise ValueError("方舟接口未返回图片 URL")
+        return image_url
 
     def _request_json(self, url: str, timeout: Optional[int] = None) -> Dict[str, Any]:
         request = Request(
@@ -588,6 +719,33 @@ class MediaParserPlugin(Star):
         configured_name = str(self.config.get("forward_node_name", "") or "").strip()
         return configured_name or fallback_name or "聚合解析助手"
 
+    def _get_aggregate_image_send_mode(self) -> str:
+        mode = str(self.config.get("aggregate_image_send_mode", "separate") or "separate").strip().lower()
+        return "forward" if mode == "forward" else "separate"
+
+    def _build_forward_nodes(self, summary: str, image_urls: List[str], fallback_name: str) -> List[Node]:
+        uin = self._get_forward_node_uin()
+        name = self._get_forward_node_name(fallback_name)
+        nodes: List[Node] = [
+            Node(
+                uin=uin,
+                name=name,
+                content=[Plain(summary)],
+            )
+        ]
+        for index, image_url in enumerate(image_urls, start=1):
+            nodes.append(
+                Node(
+                    uin=uin,
+                    name=name,
+                    content=[
+                        Plain(f"图片 {index}/{len(image_urls)}"),
+                        Image.fromURL(self._compress_image_url(image_url)),
+                    ],
+                )
+            )
+        return nodes
+
     def _is_admin_user(self, event: AstrMessageEvent) -> bool:
         raw_whitelist = self.config.get("admin_user_ids", [])
         if not raw_whitelist:
@@ -631,7 +789,7 @@ class MediaParserPlugin(Star):
         if lowered_text.startswith("/"):
             return False
 
-        if lowered_text.startswith(("jx ", "dyhome", "dyupdate", "dyupdateone", "dytarget", "dytrack", "dymenu", "dyplay", "dyrand", "dycollection", "dycollection_query", "dyck", "dyhelp")):
+        if lowered_text.startswith(("jx ", "dyhome", "dyupdate", "dyupdateone", "dytarget", "dytrack", "dymenu", "dyplay", "dyrand", "dycollection", "dycollection_query", "dyck", "dyhelp", "dyapi_on", "dyapi_off", "dyapi_status", "draw", "画")):
             return False
 
         target_url = self._extract_url(text)
@@ -688,9 +846,15 @@ class MediaParserPlugin(Star):
             return
 
         if image_urls or live_video_urls:
-            yield event.plain_result(self._format_aggregate_summary(payload, include_image_links=False))
-            for image_url in image_urls:
-                yield event.image_result(self._compress_image_url(image_url))
+            summary = self._format_aggregate_summary(payload, include_image_links=False)
+            if image_urls and self._get_aggregate_image_send_mode() == "forward":
+                author_name = self._format_aggregate_author(data.get("author")) if isinstance(data, dict) else ""
+                nodes = self._build_forward_nodes(summary, image_urls, author_name)
+                yield event.chain_result(nodes)
+            else:
+                yield event.plain_result(summary)
+                for image_url in image_urls:
+                    yield event.image_result(self._compress_image_url(image_url))
             for live_video_url in live_video_urls:
                 playable_url = self._resolve_direct_media_url(live_video_url)
                 yield event.chain_result([Video.fromURL(playable_url)])
@@ -1028,6 +1192,8 @@ class MediaParserPlugin(Star):
 
     def _get_douyin_command_definitions(self) -> "OrderedDict[str, str]":
         return OrderedDict([
+            ("/画 prompt描述", "使用火山方舟生成图片"),
+            ("/arkdiag", "检查火山方舟 SDK 运行环境"),
             ("/dyhome", "解析抖音主页并生成本地 TXT 文件"),
             ("/dytrack", "补录旧主页分享文本或链接到更新记录"),
             ("/dyupdate", "顺序更新全部已记录的抖音主页"),
@@ -1037,6 +1203,9 @@ class MediaParserPlugin(Star):
             ("/dymenu", "查看已保存的主页 TXT 播放菜单"),
             ("/dyplay", "按文件名播放 TXT 中的视频链接"),
             ("/dyrand", "轮流切换主页并随机播放其中一个视频"),
+            ("/dyapi_on", "开启 HTTP API 随机视频接口"),
+            ("/dyapi_off", "关闭 HTTP API 随机视频接口"),
+            ("/dyapi_status", "查看 HTTP API 服务状态与连通性诊断"),
             ("/dycollection", "提交点赞或收藏内容解析任务"),
             ("/dycollection_query", "查询点赞或收藏解析任务状态"),
             ("/dyck", "生成抖音登录二维码并返回 Cookie 下载链接"),
@@ -1122,6 +1291,15 @@ class MediaParserPlugin(Star):
         except Exception as exc:
             logger.warning("保存自动更新状态失败: %s", exc)
 
+    def _is_auto_update_push_unsupported_origin(self, unified_msg_origin: str) -> bool:
+        """判断当前主动推送目标是否存在已知适配器兼容问题。"""
+        normalized_origin = str(unified_msg_origin or "").strip().lower()
+        return (
+            "qqofficial_webhook" in normalized_origin
+            or "qqofficial" in normalized_origin
+            or ("qq" in normalized_origin and "webhook" in normalized_origin)
+        )
+
     async def _notify_auto_update_summary(
         self,
         total: int,
@@ -1149,8 +1327,25 @@ class MediaParserPlugin(Star):
                 lines.append(f"⚠️ 以下主页连续失败 ≥{DEFAULT_FAIL_THRESHOLD} 次，建议更换分享链接：")
                 for name in replace_hints:
                     lines.append(f"  · {name}")
-            message_chain = MessageChain([Plain("\n".join(lines))])
+            summary_text = "\n".join(lines)
+            logger.info("抖音主页自动更新汇总消息:\n%s", summary_text)
+            if self._is_auto_update_push_unsupported_origin(unified_msg_origin):
+                logger.warning(
+                    "跳过自动更新汇总主动推送：QQ 官方 Webhook 适配器存在已知 send_message 兼容问题，origin=%s",
+                    unified_msg_origin,
+                )
+                return
+            message_chain = MessageChain([Plain(summary_text)])
             await self.context.send_message(unified_msg_origin, message_chain)
+        except TypeError as exc:
+            if "super(type, obj)" in str(exc):
+                logger.warning(
+                    "跳过自动更新汇总主动推送：当前平台适配器 send_message 存在兼容问题，origin=%s，error=%s",
+                    unified_msg_origin,
+                    exc,
+                )
+                return
+            logger.exception("发送自动更新汇总消息失败: %s", exc)
         except Exception as exc:
             logger.exception("发送自动更新汇总消息失败: %s", exc)
 
@@ -1289,6 +1484,158 @@ class MediaParserPlugin(Star):
             cleaned_text = cleaned_text[len("dytrack"):].strip()
 
         return cleaned_text or None
+
+    def _format_ark_import_error(self, exc: BaseException) -> str:
+        return (
+            "火山方舟 SDK 导入失败，当前 AstrBot 运行环境未能加载 volcenginesdkarkruntime。\n"
+            f"Python：{sys.executable}\n"
+            f"错误：{type(exc).__name__}: {exc}\n"
+            "请把 SDK 安装到上面这个 Python 环境里。"
+        )
+
+    def _format_ark_diagnostics(self) -> str:
+        module_name = "volcenginesdkarkruntime"
+        lines = [
+            "火山方舟 SDK 诊断",
+            f"Python：{sys.executable}",
+            f"sys.path：{os.pathsep.join(sys.path[:8])}",
+        ]
+
+        spec = importlib.util.find_spec(module_name)
+        if spec is None:
+            lines.append("模块查找：未找到 volcenginesdkarkruntime")
+        else:
+            lines.append(f"模块查找：{spec.origin or '已找到，但无 origin'}")
+
+        try:
+            from volcenginesdkarkruntime import Ark
+            lines.append("导入测试：成功")
+            lines.append(f"Ark 类：{Ark}")
+        except Exception as exc:
+            lines.append(f"导入测试：失败，{type(exc).__name__}: {exc}")
+        return "\n".join(lines)
+
+    def _extract_draw_prompt(self, text: str) -> Optional[str]:
+        raw_text = str(text or "").strip()
+        for prefix in ["/画", "画", "/draw", "draw"]:
+            if raw_text.lower().startswith(prefix.lower()):
+                prompt = raw_text[len(prefix):].strip()
+                return prompt or None
+        return raw_text or None
+
+    def _extract_event_image_url(self, event: AstrMessageEvent) -> Optional[str]:
+        candidates = [
+            getattr(event, "message_obj", None),
+            getattr(event, "message_chain", None),
+            getattr(event, "message_str", None),
+        ]
+        for candidate in candidates:
+            image_url = self._extract_image_url_from_value(candidate, set())
+            if image_url:
+                return image_url
+        return None
+
+    def _extract_image_url_from_value(self, value: Any, seen: set) -> Optional[str]:
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            return self._extract_image_url_from_text(value)
+
+        if isinstance(value, (int, float, bool)):
+            return None
+
+        value_id = id(value)
+        if value_id in seen:
+            return None
+        seen.add(value_id)
+
+        if isinstance(value, dict):
+            image_url = self._extract_image_url_from_dict(value, seen)
+            if image_url:
+                return image_url
+            for item in value.values():
+                image_url = self._extract_image_url_from_value(item, seen)
+                if image_url:
+                    return image_url
+            return None
+
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                image_url = self._extract_image_url_from_value(item, seen)
+                if image_url:
+                    return image_url
+            return None
+
+        if isinstance(value, Image) or self._is_image_like_object(value):
+            for attr_name in ["url", "file", "path", "image", "image_url"]:
+                image_url = self._normalize_input_image_url(getattr(value, attr_name, None))
+                if image_url:
+                    return image_url
+
+        for attr_name in [
+            "message",
+            "messages",
+            "message_chain",
+            "chain",
+            "raw_message",
+            "raw",
+            "source",
+            "reply",
+            "quote",
+        ]:
+            if hasattr(value, attr_name):
+                image_url = self._extract_image_url_from_value(getattr(value, attr_name, None), seen)
+                if image_url:
+                    return image_url
+        return None
+
+    def _extract_image_url_from_dict(self, value: Dict[str, Any], seen: set) -> Optional[str]:
+        data = value.get("data") if isinstance(value.get("data"), dict) else value
+        raw_type = str(value.get("type") or value.get("msg_type") or value.get("message_type") or "").lower()
+        is_image = raw_type in {"image", "pic", "picture"} or any(key in data for key in ["image", "image_url"])
+
+        if is_image:
+            for key in ["url", "file", "path", "image", "image_url"]:
+                image_url = self._normalize_input_image_url(data.get(key))
+                if image_url:
+                    return image_url
+
+        for key in ["message", "messages", "message_chain", "chain", "raw_message", "raw", "source", "reply", "quote"]:
+            image_url = self._extract_image_url_from_value(value.get(key), seen)
+            if image_url:
+                return image_url
+        return None
+
+    def _extract_image_url_from_text(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        cq_match = re.search(r"\[CQ:image,[^\]]*(?:url|file)=([^,\]]+)", text, re.IGNORECASE)
+        if cq_match:
+            image_url = self._normalize_input_image_url(unquote(cq_match.group(1)))
+            if image_url:
+                return image_url
+
+        for match in URL_PATTERN.finditer(text):
+            image_url = self._normalize_input_image_url(match.group(0))
+            if image_url:
+                return image_url
+        return None
+
+    def _is_image_like_object(self, value: Any) -> bool:
+        class_name = value.__class__.__name__.lower()
+        raw_type = str(getattr(value, "type", "") or getattr(value, "msg_type", "") or "").lower()
+        return "image" in class_name or raw_type in {"image", "componenttype.image"}
+
+    def _normalize_input_image_url(self, value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+
+        image_url = value.strip().strip('"\'')
+        if not image_url.startswith(("http://", "https://")):
+            return None
+        return image_url
 
     def _extract_collection_text(self, text: str) -> Optional[str]:
         if not text:
@@ -2047,7 +2394,197 @@ class MediaParserPlugin(Star):
         prefix, domain, rest = match.groups()
         return f"{prefix}{domain.upper()}{rest}"
 
+    def _get_api_host(self) -> str:
+        host = str(self.config.get("api_host", "0.0.0.0") or "0.0.0.0").strip()
+        return host or "0.0.0.0"
+
+    def _get_api_port(self) -> int:
+        raw_port = self.config.get("api_port", 8080)
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError):
+            port = 8080
+        return max(port, 1)
+
+    def _get_api_local_test_url(self, path: str = "/health") -> str:
+        port = self._get_api_port()
+        return f"http://127.0.0.1:{port}{path}"
+
+    def _check_api_local_connectivity(self) -> Tuple[bool, str]:
+        if not self.api_running:
+            return False, "API 服务未运行"
+        try:
+            with urlopen(self._get_api_local_test_url(), timeout=3) as response:
+                body = response.read().decode("utf-8", errors="ignore").strip()
+                return True, f"HTTP {response.status} {body}"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def _format_api_status(self) -> str:
+        host = self._get_api_host()
+        port = self._get_api_port()
+        thread_alive = bool(self.api_server_thread and self.api_server_thread.is_alive())
+        ok, check_message = self._check_api_local_connectivity()
+        status = "运行中" if self.api_running else "未运行"
+        check_label = "成功" if ok else "失败"
+        return (
+            f"📊 API 服务状态：{status}\n"
+            f"🌐 监听地址：{host}:{port}\n"
+            f"🧵 服务线程：{'存活' if thread_alive else '未存活'}\n"
+            f"🩺 本机自检：{check_label}（{check_message}）\n"
+            f"🔗 本机测试：{self._get_api_local_test_url('/api?type=json')}\n"
+            f"⚠️ 如果 AstrBot 跑在 Docker/容器里，宿主机执行 127.0.0.1:{port} 必须先映射端口，例如 -p {port}:{port}；否则只能在容器内部 curl。"
+        )
+
+    def _get_dyrand_data(self) -> Optional[Dict[str, Any]]:
+        """获取 /dyrand 随机视频数据，供指令和 API 共用。"""
+        txt_files = self._list_download_txt_files()
+        if not txt_files:
+            return None
+
+        current_index = self.random_profile_index % len(txt_files)
+        file_name = txt_files[current_index]
+        self.random_profile_index = (current_index + 1) % len(txt_files)
+        file_path = os.path.join(DOWNLOAD_DIR, file_name)
+
+        urls = self._load_profile_play_urls(file_path)
+        checked_count = 1
+        while not urls and checked_count < len(txt_files):
+            current_index = self.random_profile_index % len(txt_files)
+            file_name = txt_files[current_index]
+            self.random_profile_index = (current_index + 1) % len(txt_files)
+            file_path = os.path.join(DOWNLOAD_DIR, file_name)
+            urls = self._load_profile_play_urls(file_path)
+            checked_count += 1
+
+        if not urls:
+            return None
+
+        video_index = self._pick_random_play_index(file_path, len(urls))
+        playable_url = self._resolve_direct_media_url(urls[video_index])
+        return {
+            "file_name": file_name,
+            "profile_index": current_index,
+            "total_profiles": len(txt_files),
+            "video_index": video_index,
+            "total_videos": len(urls),
+            "video_url": urls[video_index],
+            "playable_url": playable_url,
+        }
+
+    def _start_api_server(self) -> None:
+        """启动 HTTP API 服务（使用内置 http.server 在守护线程中运行）。"""
+        if self.api_running:
+            logger.warning("API 服务已在运行，跳过重复启动")
+            return
+
+        host = self._get_api_host()
+        port = self._get_api_port()
+        plugin_ref = self
+
+        class _ApiHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                from urllib.parse import parse_qs, urlparse
+                parsed = urlparse(self.path)
+                if parsed.path == "/health":
+                    body = b"ok"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                if parsed.path != "/api":
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write("404 Not Found".encode("utf-8"))
+                    return
+
+                params = parse_qs(parsed.query)
+                response_type = str(params.get("type", ["json"])[0]).strip().lower()
+
+                result = plugin_ref._get_dyrand_data()
+                if result is None:
+                    if response_type == "text":
+                        self.send_response(404)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write("暂无可播放的主页记录".encode("utf-8"))
+                    else:
+                        error_data = {"code": 404, "msg": "暂无可播放的主页记录"}
+                        body = json.dumps(error_data, ensure_ascii=False).encode("utf-8")
+                        self.send_response(404)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    return
+
+                if response_type == "video":
+                    self.send_response(302)
+                    self.send_header("Location", result["playable_url"])
+                    self.end_headers()
+                    return
+
+                if response_type == "text":
+                    text = (
+                        f"🎲 随机播放主页：{result['file_name']}\n"
+                        f"📍 主页进度：{result['profile_index'] + 1}/{result['total_profiles']}\n"
+                        f"🎬 视频序号：{result['video_index'] + 1}/{result['total_videos']}\n"
+                        f"🔗 视频直链：{result['playable_url']}"
+                    )
+                    body = text.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                # default: json
+                json_data = {"code": 200, "msg": "success", "data": result}
+                body = json.dumps(json_data, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                logger.debug("API %s", format % args)
+
+        class _ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self.api_http_server = _ThreadedHTTPServer((host, port), _ApiHandler)
+        self.api_server_thread = threading.Thread(
+            target=self.api_http_server.serve_forever,
+            daemon=True,
+            name="dyrand-api-server",
+        )
+        self.api_server_thread.start()
+        self.api_running = True
+        ok, check_message = self._check_api_local_connectivity()
+        logger.info("API 服务已启动，监听 %s:%s，本机自检：%s %s", host, port, "成功" if ok else "失败", check_message)
+
+    def _stop_api_server(self) -> None:
+        """停止 HTTP API 服务。"""
+        if self.api_http_server is not None:
+            self.api_http_server.shutdown()
+            self.api_http_server.server_close()
+            self.api_http_server = None
+        if self.api_server_thread is not None:
+            self.api_server_thread.join(timeout=5)
+            self.api_server_thread = None
+        self.api_running = False
+        logger.info("API 服务已关闭")
+
     async def terminate(self):
         if self.auto_update_task and not self.auto_update_task.done():
             self.auto_update_task.cancel()
-        logger.info("media_parser 插件已卸载")
+        if self.api_running:
+            self._stop_api_server()
+        logger.info("media_parser 插件已卸载")
