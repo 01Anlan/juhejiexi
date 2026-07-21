@@ -10,6 +10,7 @@ import sys
 from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin
 from urllib.request import Request, urlopen
 
@@ -35,6 +36,10 @@ DOUYIN_PROFILE_API = (
 DOUYIN_COLLECTION_API = (
     "https://douyin.zhcnli.cn/account_cookie.php"
     "?apikey={apikey}"
+)
+DOUYIN_ACCOUNT_PROFILE_API = (
+    "https://douyin.zhcnli.cn/account_profile.php"
+    "?apikey={apikey}&url="
 )
 DOUYIN_LOGIN_BASE_URL = "https://login.zhcnli.cn"
 DOUYIN_LOGIN_QRCODE_API = f"{DOUYIN_LOGIN_BASE_URL}/api/qrcode"
@@ -95,6 +100,7 @@ class MediaParserPlugin(Star):
         self.last_auto_update_check_date = str(self.auto_update_state.get("last_auto_update_check_date") or "")
         self.last_pre_check_date = str(self.auto_update_state.get("last_pre_check_date") or "")
         self.pending_update_records: Optional[List[Dict[str, Any]]] = None
+        self.pending_profile_collects: Dict[str, Dict[str, Any]] = {}
         self.instance_time_offset: int = self._init_instance_time_offset()
         self.fail_records: Dict[str, Dict[str, Any]] = self._load_fail_records()
         self.api_http_server = None
@@ -148,20 +154,73 @@ class MediaParserPlugin(Star):
             yield event.plain_result("未配置抖音主页解析 API 密钥")
             return
 
+        try:
+            account_info = self._get_account_profile_info(raw_text, douyin_profile_api_key)
+            conflict_message = self._build_profile_collect_conflict_message(raw_text, account_info)
+        except Exception as exc:
+            logger.warning("抖音主页采集前置检查失败，将继续完整解析: %s", exc)
+            account_info = {}
+            conflict_message = ""
+
+        if conflict_message:
+            pending_key = self._get_profile_collect_pending_key(event)
+            self.pending_profile_collects[pending_key] = {
+                "raw_text": raw_text,
+                "account_info": account_info,
+                "created_at": time.time(),
+            }
+            yield event.plain_result(conflict_message)
+            return
+
         yield event.plain_result("正在解析，请稍候…")
         try:
-            api_url = self._build_douyin_profile_api(raw_text, douyin_profile_api_key)
-            profile_timeout = self._get_douyin_profile_timeout()
-            payload = self._request_json(api_url, timeout=profile_timeout)
-            self._upsert_profile_record(raw_text, payload)
+            message = self._collect_douyin_profile(raw_text, douyin_profile_api_key, account_info)
         except Exception as exc:
             logger.exception("抖音主页解析失败: %s", exc)
             yield event.plain_result(f"抖音主页解析失败：{exc}")
             return
 
-        download_info = self._save_profile_txt(payload)
-        message = self._format_douyin_profile_result(payload, download_info)
         yield event.plain_result(message)
+
+    @filter.command("dyconfirm")
+    async def douyin_profile_collect_confirm(self, event: AstrMessageEvent):
+        """确认继续采集存在作者名冲突的抖音主页。"""
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
+        if not douyin_profile_api_key:
+            yield event.plain_result("未配置抖音主页解析 API 密钥")
+            return
+
+        pending_key = self._get_profile_collect_pending_key(event)
+        pending = self.pending_profile_collects.pop(pending_key, None)
+        if not pending:
+            yield event.plain_result("当前会话没有待确认的抖音主页采集任务")
+            return
+
+        raw_text = str(pending.get("raw_text") or "").strip()
+        account_info = pending.get("account_info") if isinstance(pending.get("account_info"), dict) else {}
+        if not raw_text:
+            yield event.plain_result("待确认采集任务缺少主页链接，已取消")
+            return
+
+        yield event.plain_result("已确认继续采集，正在解析，请稍候…")
+        try:
+            message = self._collect_douyin_profile(raw_text, douyin_profile_api_key, account_info)
+        except Exception as exc:
+            logger.exception("确认采集抖音主页失败: %s", exc)
+            yield event.plain_result(f"抖音主页解析失败：{exc}")
+            return
+
+        yield event.plain_result(message)
+
+    @filter.command("dyskip")
+    async def douyin_profile_collect_skip(self, event: AstrMessageEvent):
+        """跳过当前会话待确认的抖音主页采集。"""
+        pending_key = self._get_profile_collect_pending_key(event)
+        pending = self.pending_profile_collects.pop(pending_key, None)
+        if not pending:
+            yield event.plain_result("当前会话没有待跳过的抖音主页采集任务")
+            return
+        yield event.plain_result("已跳过本次抖音主页采集")
 
     @filter.command("dyupdate")
     async def douyin_profile_update_all(self, event: AstrMessageEvent):
@@ -212,6 +271,34 @@ class MediaParserPlugin(Star):
 
         yield event.plain_result(f"正在解析，请稍候…\n开始重试 {len(retry_records)} 个失败主页")
         summary = self._run_profile_update_batch(douyin_profile_api_key, retry_records)
+        yield event.plain_result(summary)
+
+    @filter.command("dyfixsec")
+    async def douyin_profile_fix_sec_user_id(self, event: AstrMessageEvent):
+        """隐藏命令：为缺少 sec_user_id 的主页记录错峰补齐账号身份标识。"""
+        if not self._is_admin_user(event):
+            yield event.plain_result("⛔ 无权限：仅白名单用户可执行此指令")
+            return
+        if not self.profile_records:
+            yield event.plain_result("暂无已记录的抖音主页，无法补齐 sec_user_id")
+            return
+
+        douyin_profile_api_key = self.config.get("douyin_profile_api_key", "")
+        if not douyin_profile_api_key:
+            yield event.plain_result("未配置抖音主页解析 API 密钥")
+            return
+
+        missing_records = [
+            record for record in self.profile_records
+            if str(record.get("raw_text") or "").strip()
+            and not str(record.get("sec_user_id") or "").strip()
+        ]
+        if not missing_records:
+            yield event.plain_result("✅ 本地记录已全部包含 sec_user_id，无需补齐")
+            return
+
+        yield event.plain_result(f"正在补齐 sec_user_id，请稍候…\n待处理账号：{len(missing_records)} 个")
+        summary = await self._fix_missing_sec_user_ids(douyin_profile_api_key, missing_records)
         yield event.plain_result(summary)
 
     @filter.command("dyupdateone")
@@ -382,7 +469,10 @@ class MediaParserPlugin(Star):
                 + "\n📌 接口说明：\n"
                 + "  /api?type=json  - 返回 JSON 格式随机视频数据\n"
                 + "  /api?type=text  - 返回纯文本随机视频信息\n"
-                + "  /api?type=video - 302 重定向到视频直链"
+                + "  /api?type=video - 302 重定向到视频直链\n"
+                + "  /api?type=menu  - 返回视频系列菜单列表\n"
+                + "  /api?type=json&file=文件名&index=1 - 返回指定主页/指定视频\n"
+                + "  /api?type=menu&file=文件名 - 返回仅该文件所属菜单"
             )
         except Exception as exc:
             logger.exception("启动 API 服务失败: %s", exc)
@@ -579,6 +669,26 @@ class MediaParserPlugin(Star):
             raise ValueError("方舟接口未返回图片 URL")
         return image_url
 
+    def _format_network_error(self, exc: Exception) -> str:
+        if isinstance(exc, HTTPError):
+            return f"接口请求失败：HTTP {exc.code} {exc.reason}"
+
+        if isinstance(exc, URLError):
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, OSError) and getattr(reason, "errno", None) == 101:
+                return "接口请求失败：当前运行环境网络不可达，请检查容器/服务器网络、DNS、代理或防火墙配置"
+            if isinstance(reason, TimeoutError):
+                return "接口请求失败：连接超时，请稍后重试或检查网络连通性"
+            return f"接口请求失败：{reason or exc}"
+
+        if isinstance(exc, TimeoutError):
+            return "接口请求失败：连接超时，请稍后重试或检查网络连通性"
+
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) == 101:
+            return "接口请求失败：当前运行环境网络不可达，请检查容器/服务器网络、DNS、代理或防火墙配置"
+
+        return f"接口请求失败：{exc}"
+
     def _request_json(self, url: str, timeout: Optional[int] = None) -> Dict[str, Any]:
         request = Request(
             url,
@@ -589,10 +699,21 @@ class MediaParserPlugin(Star):
         )
 
         request_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else DEFAULT_REQUEST_TIMEOUT
-        with urlopen(request, timeout=request_timeout) as response:
-            content = response.read().decode("utf-8", errors="ignore")
+        try:
+            with urlopen(request, timeout=request_timeout) as response:
+                content = response.read().decode("utf-8", errors="ignore").strip()
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(self._format_network_error(exc)) from exc
 
-        payload = json.loads(content)
+        if not content:
+            raise ValueError("接口返回空内容")
+
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            preview = content[:200].replace("\r", " ").replace("\n", " ")
+            raise ValueError(f"接口返回非 JSON 内容：{preview or '空'}") from exc
+
         if not isinstance(payload, dict):
             raise ValueError("接口返回格式异常")
         return payload
@@ -612,6 +733,45 @@ class MediaParserPlugin(Star):
             + quote(raw_text, safe="")
             + "&type=1&post=mode&xz=1"
         )
+
+    def _build_douyin_account_profile_api(self, raw_text: str, api_key: str) -> str:
+        return DOUYIN_ACCOUNT_PROFILE_API.format(apikey=quote(api_key, safe="")) + quote(raw_text, safe="")
+
+    def _get_account_profile_info(self, raw_text: str, api_key: str) -> Dict[str, Any]:
+        """调用账号主页接口获取昵称、作品数和 sec_user_id 等轻量资料。"""
+        if not raw_text or not api_key:
+            return {}
+
+        api_url = self._build_douyin_account_profile_api(raw_text, api_key)
+        payload = self._request_json(api_url, timeout=DEFAULT_REQUEST_TIMEOUT)
+        code = payload.get("code")
+        if code not in (200, "200", 0, "0"):
+            raise ValueError(str(payload.get("msg") or "账号主页接口返回失败"))
+        return payload
+
+    def _check_profile_count(self, raw_text: str, api_key: str) -> Optional[int]:
+        """调用账号主页接口获取远端作品数量；失败时返回 None，交由更新流程兜底。"""
+        if not raw_text or not api_key:
+            return None
+
+        try:
+            payload = self._get_account_profile_info(raw_text, api_key)
+        except Exception as exc:
+            logger.warning("获取抖音主页作品数量失败，将继续尝试完整更新: %s", exc)
+            return None
+
+        code = payload.get("code")
+        if code not in (200, "200", 0, "0"):
+            logger.warning("获取抖音主页作品数量接口返回失败: %s", payload.get("msg") or payload)
+            return None
+
+        try:
+            count = int(payload.get("count") or 0)
+        except (TypeError, ValueError):
+            logger.warning("获取抖音主页作品数量接口 count 字段异常: %s", payload.get("count"))
+            return None
+
+        return max(count, 0)
 
     def _save_douyin_login_qrcode(self, payload: Dict[str, Any]) -> Tuple[str, str]:
         code = payload.get("code")
@@ -689,6 +849,14 @@ class MediaParserPlugin(Star):
             minutes = 30
         return max(minutes, 0)
 
+    def _get_profile_update_min_new_count(self) -> int:
+        raw = self.config.get("douyin_profile_update_min_new_count", 1)
+        try:
+            min_count = int(raw)
+        except (TypeError, ValueError):
+            min_count = 1
+        return max(min_count, 1)
+
     def _calc_pre_check_time(self, auto_time: str, pre_check_minutes: int) -> str:
         """根据正式更新时间和提前分钟数，计算预检应触发的时间字符串 HH:MM。"""
         try:
@@ -715,6 +883,9 @@ class MediaParserPlugin(Star):
         except (TypeError, ValueError):
             return 0
 
+    def _can_use_forward_nodes(self) -> bool:
+        return self._get_forward_node_uin() > 0
+
     def _get_forward_node_name(self, fallback_name: str) -> str:
         configured_name = str(self.config.get("forward_node_name", "") or "").strip()
         return configured_name or fallback_name or "聚合解析助手"
@@ -726,16 +897,25 @@ class MediaParserPlugin(Star):
     def _build_forward_nodes(self, summary: str, image_urls: List[str], fallback_name: str) -> List[Node]:
         uin = self._get_forward_node_uin()
         name = self._get_forward_node_name(fallback_name)
-        content = [Plain(summary)]
-        for image_url in image_urls:
-            content.append(Image.fromURL(self._compress_image_url(image_url)))
-        return [
+        nodes: List[Node] = [
             Node(
                 uin=uin,
                 name=name,
-                content=content,
+                content=[Plain(summary)],
             )
         ]
+        for index, image_url in enumerate(image_urls, start=1):
+            nodes.append(
+                Node(
+                    uin=uin,
+                    name=name,
+                    content=[
+                        Plain(f"图片 {index}/{len(image_urls)}"),
+                        Image.fromURL(self._compress_image_url(image_url)),
+                    ],
+                )
+            )
+        return nodes
 
     def _is_admin_user(self, event: AstrMessageEvent) -> bool:
         raw_whitelist = self.config.get("admin_user_ids", [])
@@ -837,15 +1017,35 @@ class MediaParserPlugin(Star):
             return
 
         if image_urls or live_video_urls:
-            summary = self._format_aggregate_summary(payload, include_image_links=False)
-            if image_urls and self._get_aggregate_image_send_mode() == "forward":
+            safe_image_urls = [image_url for image_url in image_urls if self._should_embed_image_url(image_url)]
+            has_unsafe_image_urls = len(safe_image_urls) != len(image_urls)
+            summary = self._format_aggregate_summary(
+                payload,
+                include_image_links=has_unsafe_image_urls or not safe_image_urls,
+            )
+            use_forward_nodes = (
+                image_urls
+                and not has_unsafe_image_urls
+                and self._get_aggregate_image_send_mode() == "forward"
+                and self._can_use_forward_nodes()
+            )
+            if image_urls and self._get_aggregate_image_send_mode() == "forward" and not self._can_use_forward_nodes():
+                logger.warning("聚合解析已配置为合并转发，但未配置有效的 forward_node_uin，已回退为普通图片发送")
+            if has_unsafe_image_urls:
+                logger.warning(
+                    "聚合解析图片链接包含不适合直接下载的直链，已回退为文本链接发送：%s",
+                    ", ".join(image_urls),
+                )
+
+            if use_forward_nodes:
                 author_name = self._format_aggregate_author(data.get("author")) if isinstance(data, dict) else ""
-                nodes = self._build_forward_nodes(summary, image_urls, author_name)
+                nodes = self._build_forward_nodes(summary, safe_image_urls, author_name)
                 yield event.chain_result(nodes)
             else:
                 yield event.plain_result(summary)
-                for image_url in image_urls:
-                    yield event.image_result(self._compress_image_url(image_url))
+                if not has_unsafe_image_urls:
+                    for image_url in safe_image_urls:
+                        yield event.image_result(self._compress_image_url(image_url))
             for live_video_url in live_video_urls:
                 playable_url = self._resolve_direct_media_url(live_video_url)
                 yield event.chain_result([Video.fromURL(playable_url)])
@@ -966,7 +1166,7 @@ class MediaParserPlugin(Star):
             logger.info("开始执行定时自动更新，共 %s 个主页记录", total)
             success_count = 0
             failed_count = 0
-            skip_count = 0
+            skip_count = max(total_all - total, 0) if target_records is not None else 0
             auto_update_interval = self._get_auto_update_interval()
             actual_records = list(target_records) if target_records is not None else list(self.profile_records)
             threshold = DEFAULT_FAIL_THRESHOLD
@@ -1000,8 +1200,8 @@ class MediaParserPlugin(Star):
                     await asyncio.sleep(jitter)
             self._save_fail_records()
             logger.info(
-                "抖音主页自动更新全部完成：共 %s 个，更新 %s 个，跳过 %s 个，失败 %s 个",
-                total,
+                "抖音主页自动更新全部完成：共 %s 个，更新 %s 个，无需更新 %s 个，失败 %s 个",
+                total_all,
                 success_count,
                 skip_count,
                 failed_count,
@@ -1026,7 +1226,8 @@ class MediaParserPlugin(Star):
         self.pre_check_running = True
         try:
             total = len(self.profile_records)
-            logger.info("开始预检扫描，共 %s 个主页记录", total)
+            min_new_count = self._get_profile_update_min_new_count()
+            logger.info("开始预检扫描，共 %s 个主页记录，最小新增阈值 %s", total, min_new_count)
             pending: List[Dict[str, Any]] = []
             auto_update_interval = self._get_auto_update_interval()
             for index, record in enumerate(self.profile_records, start=1):
@@ -1035,17 +1236,27 @@ class MediaParserPlugin(Star):
                     continue
                 local_count = int(record.get("count") or 0)
                 remote_count = self._check_profile_count(raw_text, douyin_profile_api_key)
-                if remote_count is None or remote_count > local_count:
-                    author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
+                author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
+                if remote_count is None or local_count <= 0:
                     logger.info(
-                        "预检 %s/%s %s：远端 %s > 本地 %s，加入待更新队列",
+                        "预检 %s/%s %s：数量未知（远端 %s，本地 %s），加入待更新队列兜底",
                         index, total, author,
                         remote_count if remote_count is not None else "?", local_count,
                     )
                     pending.append(record)
                 else:
-                    author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
-                    logger.info("预检 %s/%s %s：无新作品（%s），跳过", index, total, author, remote_count)
+                    new_count = remote_count - local_count
+                    if new_count >= min_new_count:
+                        logger.info(
+                            "预检 %s/%s %s：新增 %s 个，达到阈值 %s，加入待更新队列",
+                            index, total, author, new_count, min_new_count,
+                        )
+                        pending.append(record)
+                    else:
+                        logger.info(
+                            "预检 %s/%s %s：新增 %s 个，未达到阈值 %s，跳过",
+                            index, total, author, new_count, min_new_count,
+                        )
                 if index < total and auto_update_interval > 0:
                     jitter = random.uniform(auto_update_interval, auto_update_interval * 2)
                     await asyncio.sleep(jitter)
@@ -1095,7 +1306,7 @@ class MediaParserPlugin(Star):
             "📊 更新完成汇总",
             f"📦 总数：{total}",
             f"✔️ 成功：{success_count}",
-            f"⏭️ 跳过：{skip_count}",
+            f"⏭️ 无需更新账号：{skip_count}",
             f"❌ 失败：{len(failed_authors)}",
         ]
         if failed_authors:
@@ -1106,6 +1317,66 @@ class MediaParserPlugin(Star):
             lines.append("⚠️ 以下主页连续失败 ≥{} 次，建议更换分享链接：".format(threshold))
             for name in replace_hints:
                 lines.append(f"  · {name}")
+        return "\n".join(lines)
+
+    async def _fix_missing_sec_user_ids(self, douyin_profile_api_key: str, records: List[Dict[str, Any]]) -> str:
+        """错峰补齐缺失的 sec_user_id，并返回汇总文本。"""
+        total = len(records)
+        success_count = 0
+        skip_count = 0
+        failed_items: List[str] = []
+        auto_update_interval = self._get_auto_update_interval()
+
+        for index, record in enumerate(records, start=1):
+            raw_text = str(record.get("raw_text") or "").strip()
+            author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
+            if not raw_text:
+                skip_count += 1
+                continue
+            if str(record.get("sec_user_id") or "").strip():
+                skip_count += 1
+                continue
+
+            try:
+                account_info = self._get_account_profile_info(raw_text, douyin_profile_api_key)
+                sec_user_id = str(account_info.get("sec_user_id") or "").strip()
+                if not sec_user_id:
+                    failed_items.append(f"{author}（接口未返回 sec_user_id）")
+                else:
+                    record["sec_user_id"] = sec_user_id
+                    nickname = self._normalize_author_name(str(account_info.get("nickname") or "").strip())
+                    if nickname and not str(record.get("author") or "").strip():
+                        record["author"] = nickname
+                    if account_info.get("count") is not None:
+                        record["count"] = account_info.get("count") or 0
+                    share_url = str(account_info.get("share_url") or "").strip()
+                    if share_url and not str(record.get("share_url") or "").strip():
+                        record["share_url"] = share_url
+                    record["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    success_count += 1
+            except Exception as exc:
+                failed_items.append(f"{author}（{self._format_network_error(exc)}）")
+                logger.warning("补齐 sec_user_id 失败：%s，error=%s", author, exc)
+
+            if index < total and auto_update_interval > 0:
+                jitter = random.uniform(auto_update_interval, auto_update_interval * 2)
+                logger.info("补齐 sec_user_id 错峰等待 %.1f 秒后继续下一项（随机抖动 %s~%s 秒）", jitter, auto_update_interval, auto_update_interval * 2)
+                await asyncio.sleep(jitter)
+
+        if success_count > 0:
+            self._save_profile_records()
+
+        lines = [
+            "✅ sec_user_id 补齐完成",
+            f"📦 待处理：{total}",
+            f"✔️ 补齐成功：{success_count}",
+            f"⏭️ 已有或无链接跳过：{skip_count}",
+            f"❌ 失败：{len(failed_items)}",
+        ]
+        if failed_items:
+            lines.append("失败账号：" + "、".join(failed_items[:10]))
+            if len(failed_items) > 10:
+                lines.append(f"另有 {len(failed_items) - 10} 个失败账号未展示")
         return "\n".join(lines)
 
     def _load_fail_records(self) -> Dict[str, Dict[str, Any]]:
@@ -1126,6 +1397,69 @@ class MediaParserPlugin(Star):
         except Exception as exc:
             logger.warning("保存失败记录文件出错: %s", exc)
 
+    def _get_profile_collect_pending_key(self, event: AstrMessageEvent) -> str:
+        unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        session_id = str(getattr(event, "session_id", "") or "").strip()
+        sender_id = ""
+        try:
+            sender_id = str(event.message_obj.sender.user_id).strip()
+        except Exception:
+            sender_id = ""
+        return unified_msg_origin or session_id or sender_id or "default"
+
+    def _build_profile_collect_conflict_message(self, raw_text: str, account_info: Dict[str, Any]) -> str:
+        new_author = self._normalize_author_name(
+            str(account_info.get("nickname") or account_info.get("author") or "").strip()
+        )
+        new_sec_user_id = str(account_info.get("sec_user_id") or "").strip()
+        if not new_author:
+            return ""
+
+        conflict_records: List[Tuple[Dict[str, Any], str]] = []
+        for record in self.profile_records:
+            old_author = self._normalize_author_name(str(record.get("author") or "").strip())
+            if not old_author:
+                continue
+            old_sec_user_id = str(record.get("sec_user_id") or "").strip()
+            same_author = old_author == new_author
+            similar_author = (
+                old_author != new_author
+                and len(old_author) >= 2
+                and len(new_author) >= 2
+                and (old_author in new_author or new_author in old_author)
+            )
+            if not same_author and not similar_author:
+                continue
+            if not old_sec_user_id:
+                continue
+            if new_sec_user_id and new_sec_user_id == old_sec_user_id:
+                continue
+            conflict_records.append((record, "相同作者名" if same_author else "相似作者名"))
+
+        if not conflict_records:
+            return ""
+
+        lines = [
+            "⚠️ 检测到可能重复的抖音主页采集",
+            f"👤 新主页作者：{self._sanitize_markdown_text(new_author)}",
+        ]
+        if new_sec_user_id:
+            lines.append(f"🆔 新 sec_user_id：{new_sec_user_id}")
+        lines.append("📌 本地相似记录：")
+        for record, reason in conflict_records[:5]:
+            old_author = self._sanitize_markdown_text(str(record.get("author") or "未知作者"))
+            old_sec_user_id = str(record.get("sec_user_id") or "未记录").strip()
+            old_count = record.get("count") or 0
+            lines.append(f"- {reason}：{old_author}｜作品数 {old_count}｜sec_user_id {old_sec_user_id}")
+        if len(conflict_records) > 5:
+            lines.append(f"- 另有 {len(conflict_records) - 5} 条相似记录未展示")
+        lines.extend([
+            "",
+            "如确认这是新主页或仍要覆盖/采集，请发送 /dyconfirm",
+            "如不采集，请发送 /dyskip",
+        ])
+        return "\n".join(lines)
+
     def _iter_profile_update_messages(self, douyin_profile_api_key: str, records: Optional[List[Dict[str, Any]]] = None):
         target_records = list(records) if records is not None else list(self.profile_records)
         total = len(target_records)
@@ -1140,6 +1474,22 @@ class MediaParserPlugin(Star):
         author = self._normalize_author_name(str(record.get("author") or "").strip()) or f"记录{index}"
         old_urls = self._load_existing_profile_urls(record)
         try:
+            local_count = int(record.get("count") or 0)
+            remote_count = self._check_profile_count(raw_text, douyin_profile_api_key)
+            min_new_count = self._get_profile_update_min_new_count()
+            if remote_count is not None and local_count > 0:
+                display_author = self._sanitize_markdown_text(author)
+                new_count = remote_count - local_count
+                if new_count < min_new_count:
+                    return (
+                        f"⏭️ {index}/{total} 新增作品数未达到阈值，已跳过\n"
+                        f"👤 作者：{display_author}\n"
+                        f"📦 远端作品数：{remote_count}\n"
+                        f"📦 本地记录数：{local_count}\n"
+                        f"🆕 新增作品数：{new_count}\n"
+                        f"🎯 更新阈值：{min_new_count}"
+                    )
+
             api_url = self._build_douyin_profile_api(raw_text, douyin_profile_api_key)
             payload = self._request_json(api_url, timeout=self._get_douyin_profile_timeout())
             download_info = self._save_profile_txt(payload)
@@ -1186,6 +1536,8 @@ class MediaParserPlugin(Star):
             ("/画 prompt描述", "使用火山方舟生成图片"),
             ("/arkdiag", "检查火山方舟 SDK 运行环境"),
             ("/dyhome", "解析抖音主页并生成本地 TXT 文件"),
+            ("/dyconfirm", "确认继续采集存在作者名冲突的抖音主页"),
+            ("/dyskip", "跳过当前待确认的抖音主页采集"),
             ("/dytrack", "补录旧主页分享文本或链接到更新记录"),
             ("/dyupdate", "顺序更新全部已记录的抖音主页"),
             ("/dyupdateone", "按作者名或文件名更新单个主页记录"),
@@ -1308,7 +1660,7 @@ class MediaParserPlugin(Star):
                 "✅ 抖音主页自动更新全部完成",
                 f"📦 总数：{total}",
                 f"✔️ 成功：{success_count}",
-                f"⏭️ 跳过（无新作品）：{skip_count}",
+                f"⏭️ 无需更新账号：{skip_count}",
                 f"❌ 失败：{failed_count}",
             ]
             if failed_count > 0:
@@ -1411,6 +1763,23 @@ class MediaParserPlugin(Star):
         except Exception as exc:
             logger.warning("保存抖音主页记录失败: %s", exc)
 
+    def _collect_douyin_profile(
+        self,
+        raw_text: str,
+        douyin_profile_api_key: str,
+        account_info: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        api_url = self._build_douyin_profile_api(raw_text, douyin_profile_api_key)
+        profile_timeout = self._get_douyin_profile_timeout()
+        payload = self._request_json(api_url, timeout=profile_timeout)
+        if isinstance(account_info, dict) and account_info:
+            payload = {**account_info, **payload}
+            if account_info.get("nickname") and not payload.get("author"):
+                payload["author"] = account_info.get("nickname")
+        self._upsert_profile_record(raw_text, payload)
+        download_info = self._save_profile_txt(payload)
+        return self._format_douyin_profile_result(payload, download_info)
+
     def _upsert_profile_record(self, raw_text: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         normalized_raw_text = raw_text.strip()
         record: Dict[str, Any] = {
@@ -1419,13 +1788,16 @@ class MediaParserPlugin(Star):
         }
 
         if isinstance(payload, dict):
-            author = self._normalize_author_name(str(payload.get("author") or "").strip())
+            author = self._normalize_author_name(str(payload.get("author") or payload.get("nickname") or "").strip())
+            sec_user_id = str(payload.get("sec_user_id") or "").strip()
             file_name = ""
             download = self._extract_download_url(payload)
             if download:
                 file_name = self._extract_file_name(download)
             if author:
                 record["author"] = author
+            if sec_user_id:
+                record["sec_user_id"] = sec_user_id
             record["count"] = payload.get("count") or 0
             if file_name:
                 record["file_name"] = file_name
@@ -1436,6 +1808,14 @@ class MediaParserPlugin(Star):
                 self.profile_records[index] = merged
                 self._save_profile_records()
                 return merged
+
+        if record.get("sec_user_id"):
+            for index, item in enumerate(self.profile_records):
+                if str(item.get("sec_user_id") or "").strip() == str(record.get("sec_user_id") or "").strip():
+                    merged = {**item, **record}
+                    self.profile_records[index] = merged
+                    self._save_profile_records()
+                    return merged
 
         self.profile_records.append(record)
         self._save_profile_records()
@@ -1923,20 +2303,21 @@ class MediaParserPlugin(Star):
         rows: List[str] = []
 
         for start_index in range(0, len(display_names), 3):
-            row_items = []
-            for column_offset, name in enumerate(display_names[start_index:start_index + 3], start=1):
-                index = start_index + column_offset
-                icon = "◉" if index <= 3 else "○"
-                row_items.append(f"{icon} {name}")
-            rows.append("  ".join(row_items))
+            row = display_names[start_index:start_index + 3]
+            if len(row) == 3:
+                rows.append("┆".join(row))
+            else:
+                rows.append("┆".join(row))
+
+        if not rows:
+            rows.append("暂无可播放内容")
 
         lines: List[str] = [
-            "┏━🎵 抖音主页菜单 ━┓",
+            "──   ──",
+            "视频系列",
+            "────        ──────",
             *rows,
-            "┣━ 使用方法",
-            "┃ /dyplay 猫姨",
-            "┃ /dyrand 随机播放下一个主页",
-            "┗━━━━━━━━━━━━━━┛",
+            "───     ─────",
         ]
         return "\n".join(lines)
 
@@ -2024,8 +2405,8 @@ class MediaParserPlugin(Star):
             with urlopen(request, timeout=20) as response:
                 final_url = response.geturl()
                 return final_url or url
-        except Exception as exc:
-            logger.warning("直链访问失败，回退原链接: %s", exc)
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            logger.warning("直链访问失败，回退原链接: %s", self._format_network_error(exc))
             return url
 
     def _format_collection_submit_result(self, payload: Dict[str, Any]) -> str:
@@ -2277,6 +2658,21 @@ class MediaParserPlugin(Star):
             clean_url = f"{clean_url}{separator}imageView2/2/w/1080/format/jpg"
         return clean_url
 
+    def _should_embed_image_url(self, url: str) -> bool:
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            return False
+
+        lowered_url = url.lower()
+        unsafe_markers = (
+            "byteimg.com",
+            "imagex-sign",
+            "flow-imagex",
+            "xiaohongshu.com",
+            "xhslink.com",
+            "xhscdn",
+        )
+        return not any(marker in lowered_url for marker in unsafe_markers)
+
     def _pick_live_video_urls(self, data: Dict[str, Any]) -> List[str]:
         candidates: List[str] = []
         for key in ["live_photo", "livePhotos", "images"]:
@@ -2424,34 +2820,56 @@ class MediaParserPlugin(Star):
             f"🧵 服务线程：{'存活' if thread_alive else '未存活'}\n"
             f"🩺 本机自检：{check_label}（{check_message}）\n"
             f"🔗 本机测试：{self._get_api_local_test_url('/api?type=json')}\n"
+            f"📌 指定播放：/api?type=json&file=文件名&index=1\n"
             f"⚠️ 如果 AstrBot 跑在 Docker/容器里，宿主机执行 127.0.0.1:{port} 必须先映射端口，例如 -p {port}:{port}；否则只能在容器内部 curl。"
         )
 
-    def _get_dyrand_data(self) -> Optional[Dict[str, Any]]:
-        """获取 /dyrand 随机视频数据，供指令和 API 共用。"""
+    def _get_dyrand_data(
+        self,
+        file_key: Optional[str] = None,
+        video_index: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """获取随机或指定主页/视频数据，供指令和 API 共用。"""
         txt_files = self._list_download_txt_files()
         if not txt_files:
             return None
 
-        current_index = self.random_profile_index % len(txt_files)
-        file_name = txt_files[current_index]
-        self.random_profile_index = (current_index + 1) % len(txt_files)
-        file_path = os.path.join(DOWNLOAD_DIR, file_name)
-
-        urls = self._load_profile_play_urls(file_path)
-        checked_count = 1
-        while not urls and checked_count < len(txt_files):
+        if file_key:
+            file_path = self._find_download_txt(file_key)
+            if not file_path:
+                return None
+            file_name = os.path.basename(file_path)
+            try:
+                current_index = txt_files.index(file_name)
+            except ValueError:
+                current_index = 0
+            urls = self._load_profile_play_urls(file_path)
+            if not urls:
+                return None
+        else:
             current_index = self.random_profile_index % len(txt_files)
             file_name = txt_files[current_index]
             self.random_profile_index = (current_index + 1) % len(txt_files)
             file_path = os.path.join(DOWNLOAD_DIR, file_name)
-            urls = self._load_profile_play_urls(file_path)
-            checked_count += 1
 
-        if not urls:
+            urls = self._load_profile_play_urls(file_path)
+            checked_count = 1
+            while not urls and checked_count < len(txt_files):
+                current_index = self.random_profile_index % len(txt_files)
+                file_name = txt_files[current_index]
+                self.random_profile_index = (current_index + 1) % len(txt_files)
+                file_path = os.path.join(DOWNLOAD_DIR, file_name)
+                urls = self._load_profile_play_urls(file_path)
+                checked_count += 1
+
+            if not urls:
+                return None
+
+        if video_index is None:
+            video_index = self._pick_random_play_index(file_path, len(urls))
+        elif video_index < 0 or video_index >= len(urls):
             return None
 
-        video_index = self._pick_random_play_index(file_path, len(urls))
         playable_url = self._resolve_direct_media_url(urls[video_index])
         return {
             "file_name": file_name,
@@ -2495,18 +2913,100 @@ class MediaParserPlugin(Star):
 
                 params = parse_qs(parsed.query)
                 response_type = str(params.get("type", ["json"])[0]).strip().lower()
+                file_key = str(params.get("file", [""])[0] or params.get("name", [""])[0]).strip()
+                index_text = str(params.get("index", [""])[0] or params.get("video_index", [""])[0]).strip()
+                if response_type == "menu":
+                    menu_text = plugin_ref._format_douyin_menu(plugin_ref._list_download_txt_files())
+                    if menu_text.strip():
+                        body = menu_text.encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    else:
+                        body = "暂无可播放的主页记录".encode("utf-8")
+                        self.send_response(404)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    return
+                requested_index: Optional[int] = None
+                if index_text:
+                    try:
+                        requested_index = int(index_text)
+                    except ValueError:
+                        error_message = "index 参数必须是整数"
+                        if response_type == "text":
+                            self.send_response(400)
+                            self.send_header("Content-Type", "text/plain; charset=utf-8")
+                            self.end_headers()
+                            self.wfile.write(error_message.encode("utf-8"))
+                        else:
+                            body = json.dumps({"code": 400, "msg": error_message}, ensure_ascii=False).encode("utf-8")
+                            self.send_response(400)
+                            self.send_header("Content-Type", "application/json; charset=utf-8")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                        return
 
-                result = plugin_ref._get_dyrand_data()
-                if result is None:
+                if requested_index is not None and requested_index < 1:
+                    error_message = "index 参数必须从 1 开始"
+                    if response_type == "text":
+                        self.send_response(400)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(error_message.encode("utf-8"))
+                    else:
+                        body = json.dumps({"code": 400, "msg": error_message}, ensure_ascii=False).encode("utf-8")
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    return
+
+                if file_key and not plugin_ref._find_download_txt(file_key):
+                    error_message = f"未找到文件：{file_key}"
                     if response_type == "text":
                         self.send_response(404)
                         self.send_header("Content-Type", "text/plain; charset=utf-8")
                         self.end_headers()
-                        self.wfile.write("暂无可播放的主页记录".encode("utf-8"))
+                        self.wfile.write(error_message.encode("utf-8"))
                     else:
-                        error_data = {"code": 404, "msg": "暂无可播放的主页记录"}
-                        body = json.dumps(error_data, ensure_ascii=False).encode("utf-8")
+                        body = json.dumps({"code": 404, "msg": error_message}, ensure_ascii=False).encode("utf-8")
                         self.send_response(404)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    return
+
+                result = plugin_ref._get_dyrand_data(
+                    file_key=file_key or None,
+                    video_index=(requested_index - 1) if requested_index is not None and requested_index != -1 else None,
+                )
+                if result is None:
+                    if file_key and requested_index is not None and requested_index != -1:
+                        error_message = "指定的 index 超出当前 TXT 文件范围"
+                        status_code = 404
+                    elif file_key:
+                        error_message = f"TXT 文件为空：{file_key}"
+                        status_code = 404
+                    else:
+                        error_message = "暂无可播放的主页记录"
+                        status_code = 404
+
+                    if response_type == "text":
+                        self.send_response(status_code)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(error_message.encode("utf-8"))
+                    else:
+                        body = json.dumps({"code": status_code, "msg": error_message}, ensure_ascii=False).encode("utf-8")
+                        self.send_response(status_code)
                         self.send_header("Content-Type", "application/json; charset=utf-8")
                         self.send_header("Content-Length", str(len(body)))
                         self.end_headers()
@@ -2520,8 +3020,9 @@ class MediaParserPlugin(Star):
                     return
 
                 if response_type == "text":
+                    mode_label = "指定播放" if (file_key or requested_index is not None) else "随机播放"
                     text = (
-                        f"🎲 随机播放主页：{result['file_name']}\n"
+                        f"🎲 {mode_label}主页：{result['file_name']}\n"
                         f"📍 主页进度：{result['profile_index'] + 1}/{result['total_profiles']}\n"
                         f"🎬 视频序号：{result['video_index'] + 1}/{result['total_videos']}\n"
                         f"🔗 视频直链：{result['playable_url']}"
@@ -2536,6 +3037,12 @@ class MediaParserPlugin(Star):
 
                 # default: json
                 json_data = {"code": 200, "msg": "success", "data": result}
+                if file_key or requested_index is not None:
+                    json_data["mode"] = "specified"
+                    json_data["request"] = {
+                        "file": file_key or "",
+                        "index": requested_index,
+                    }
                 body = json.dumps(json_data, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2578,4 +3085,4 @@ class MediaParserPlugin(Star):
             self.auto_update_task.cancel()
         if self.api_running:
             self._stop_api_server()
-        logger.info("media_parser 插件已卸载")
+        logger.info("media_parser 插件已卸载")
