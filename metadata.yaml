@@ -1,7 +1,7 @@
 name: astrbot_plugin_juhejiexi # 插件唯一识别名
 display_name: 聚合解析助手 # 插件展示名称
-desc: 聚合解析与抖音主页解析插件 # 插件简短描述
-help: /jx，/dyhome，/dytrack，/dytarget，/dyplay，/dyupdate，/dyupdateone，/dycollection，/dycollection_query # 插件帮助信息
-version: v1.0.1 # 插件版本号
+desc: 聚合解析、火山方舟文生图、抖音主页采集/更新/播放与 HTTP API 插件 # 插件简短描述
+help: /jx，/画，/draw，/arkdiag，/dyhome，/dyconfirm，/dyskip，/dytrack，/dytarget，/dymenu，/dyplay，/dyrand，/dyupdate，/dyupdateone，/dyretry，/dycollection，/dycollection_query，/dyck，/dyapi_on，/dyapi_off，/dyapi_status # 插件帮助信息
+version: v1.1.0 # 插件版本号
 author: Anlan # 作者
-repo: https://github.com/01Anlan/juhejiexi # 插件仓库地址
+repo: https://github.com/01Anlan/juhejiexi # 插件仓库地址
